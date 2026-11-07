@@ -5,7 +5,7 @@ import { rgbOf, threadFromHex } from '../core/threads';
 import type { EmbObject, FillParams, SatinParams, Underlay } from '../core/types';
 import { fontInfo, onFontLoaded, SCRIPT_NAMES } from '../core/text';
 import * as act from './actions';
-import { fontPicker, threadPicker } from './dialogs';
+import { fontPicker, outlineDialog, threadPicker } from './dialogs';
 import { toolOpts } from './tools';
 import { estimateMinutes } from '../core/plan';
 
@@ -187,7 +187,7 @@ export function properties(el: HTMLElement) {
       h('div', { class: 'actions' },
         btn('→ Remplissage', () => act.convert('fill')), btn('→ Satin', () => act.convert('satin')),
         btn('→ Point avant', () => act.convert('run')), btn('→ Appliqué', () => act.convert('applique')),
-        btn('Bordure satin', () => act.outlineOffset(1.5, 'satin', 2.5)), btn('Contour décalé', () => act.outlineOffset(2, 'run')),
+        btn('Contour…', outlineDialog), btn('Bordure satin', () => act.outlineOffset(1.5, 'satin', 2.5)), btn('Contour décalé', () => act.outlineOffset(2, 'run')),
         btn('Combiner', act.combine), btn('Séparer', act.breakApart),
         btn('Retirer chevauchements', act.removeOverlaps),
       ),

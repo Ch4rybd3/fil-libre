@@ -1,6 +1,6 @@
 // Numérisation automatique : image → zones de couleur → objets de broderie.
 import { Cmd, type EmbObject, type Poly, type Pt, type Stitch, type Thread } from '../core/types';
-import { chaikin, douglasPeucker, polyLength, principalAngle, signedArea, splitIslands, normalize } from '../core/geometry';
+import { chaikin, douglasPeucker, polyLength, resample, principalAngle, signedArea, splitIslands, normalize } from '../core/geometry';
 import { nearestThread, rgbToLab } from '../core/threads';
 import { makeFill, makeRun, makeSatin, uid } from '../core/defaults';
 
@@ -28,12 +28,21 @@ export interface AutoOptions {
   outlineColor: 'each' | 'darkest' | 'lines';
   outlineStitch: 'triple' | 'simple' | 'satin';
   outlineWidth: number;     // largeur du satin de contour (mm)
+  keepLines: boolean;       // détecter les traits fins foncés (même anticrénelés) et les garder
+  lineSatin: boolean;       // zones longues et fines → colonne satin qui suit le trait
+  linesLast: boolean;       // broder les traits de la couleur la plus foncée en dernier (finition)
+  outer: boolean;           // contour extérieur complet qui ferme le motif (brodé en tout dernier)
+  outerThread: Thread | null; // couleur du contour extérieur (null = la plus foncée du motif)
+  outerStitch: 'satin' | 'triple' | 'simple';
+  outerWidth: number;       // largeur du satin extérieur (mm)
 }
 
 export const defaultAuto: AutoOptions = {
   widthMm: 90, colors: 6, removeBg: true, bgOutsideOnly: true, smooth: 2, minAreaMm2: 2, satinWidth: 2.5, outline: false, contour: 'none',
   threadChart: 'Janome/Elna', denoise: true, precision: 0.2, mergeDE: 0, groups: [], excluded: [],
   render: 'fill', outlineColor: 'lines', outlineStitch: 'triple', outlineWidth: 1.2,
+  keepLines: true, lineSatin: true, linesLast: true,
+  outer: false, outerThread: null, outerStitch: 'satin', outerWidth: 1,
 };
 
 export interface Quantized {
@@ -215,6 +224,21 @@ export function quantize(img: ImageData, o: AutoOptions, raw = false): Quantized
   if (!raw) {
     for (let pass = 0; pass < 2; pass++) labels = modeFilter(labels, w, h, cents.length);
     mergeTransitionColors(labels, w, h, labOf);
+    if (o.keepLines) {
+      // la couleur des traits est-elle le fond qui sera entièrement retiré ? (logo sur fond noir)
+      let darkIsBg = false;
+      if (o.removeBg && !hasAlpha && !o.bgOutsideOnly) {
+        const cnt = new Map<number, number>();
+        const addB = (i: number) => cnt.set(labels[i], (cnt.get(labels[i]) ?? 0) + 1);
+        for (let x = 0; x < w; x++) { addB(x); addB((h - 1) * w + x); }
+        for (let y = 0; y < h; y++) { addB(y * w); addB(y * w + w - 1); }
+        const b = [...cnt.entries()].filter(([l]) => l >= 0).sort((a, c) => c[1] - a[1])[0]?.[0] ?? -1;
+        const present = [...new Set(Array.from(labels).filter((l) => l >= 0))];
+        const dk = present.reduce((a, c) => (labOf[a][0] < labOf[c][0] ? a : c), present[0]);
+        darkIsBg = b >= 0 && b === dk;
+      }
+      forceThinLines(labels, w, h, lab, labOf, darkIsBg);
+    }
   }
   // devenir de chaque nuance (une nuance absorbée suit celle qui l'a reçue lors des regroupements manuels)
   const K = cents.length;
@@ -236,6 +260,7 @@ export function quantize(img: ImageData, o: AutoOptions, raw = false): Quantized
     if (bgLabel >= 0) {
       if (o.bgOutsideOnly && !raw) floodFromBorder(labels, w, h, bgLabel);
       else for (let i = 0; i < N; i++) if (labels[i] === bgLabel) labels[i] = -1;
+      if (!raw) fillCracks(labels, w, h, Math.max(1, Math.round(0.4 / (o.widthMm / w))));
     }
   }
   // couleurs exclues par l'utilisateur
@@ -245,10 +270,94 @@ export function quantize(img: ImageData, o: AutoOptions, raw = false): Quantized
   }
   const palette: RGB[] = labOf.map((c) => labToRgb(c));
   const mmPerPx = o.widthMm / w;
-  if (!raw) removeSmall(labels, w, h, Math.max(1, o.minAreaMm2 / (mmPerPx * mmPerPx)));
+  if (!raw) removeSmall(labels, w, h, Math.max(1, o.minAreaMm2 / (mmPerPx * mmPerPx)), labOf, Math.max(4, 0.4 / (mmPerPx * mmPerPx)));
   const counts = new Int32Array(cents.length);
   for (let i = 0; i < N; i++) if (labels[i] >= 0) counts[labels[i]]++;
   return { w, h, mmPerPx, labels, palette, lab: labOf, counts, fate, bgLabel };
+}
+
+/** Filtre max (ou min) carré de rayon r, séparable. */
+function rankFilter(src: Float32Array, w: number, h: number, r: number, max: boolean): Float32Array {
+  const tmp = new Float32Array(src.length), out = new Float32Array(src.length);
+  const pick = max ? Math.max : Math.min;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = src[y * w + x];
+    for (let d = -r; d <= r; d++) { const xx = x + d; if (xx >= 0 && xx < w) v = pick(v, src[y * w + xx]); }
+    tmp[y * w + x] = v;
+  }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let v = tmp[y * w + x];
+    for (let d = -r; d <= r; d++) { const yy = y + d; if (yy >= 0 && yy < h) v = pick(v, tmp[yy * w + x]); }
+    out[y * w + x] = v;
+  }
+  return out;
+}
+
+/**
+ * Les traits fins d'un dessin (1–3 px) sont adoucis par l'anticrénelage : leurs pixels sont gris ou
+ * vert foncé plutôt que noirs et finissent rangés avec la couleur voisine. On les repère comme
+ * « plus sombres que leur voisinage » (top-hat noir sur la luminance) et on les rend à la couleur des traits.
+ */
+function forceThinLines(labels: Int16Array, w: number, h: number, lab: number[][], labOf: Lab[], darkIsBg = false) {
+  const present = [...new Set(Array.from(labels).filter((l) => l >= 0))];
+  if (present.length < 2) return;
+  const dark = present.reduce((a, b) => (labOf[a][0] < labOf[b][0] ? a : b));
+  const Ld = labOf[dark][0];
+  if (Ld > 40) return; // pas de couleur de trait franche dans l'image
+  const N = w * h;
+  const L = new Float32Array(N);
+  for (let i = 0; i < N; i++) L[i] = labels[i] < 0 ? 100 : lab[i][0];
+  // si le noir est le fond retiré, ses traits fins deviendraient des trous : on ne les force pas
+  const closed = darkIsBg ? null : rankFilter(rankFilter(L, w, h, 2, true), w, h, 2, false);
+  if (closed) for (let i = 0; i < N; i++) {
+    if (labels[i] < 0 || labels[i] === dark) continue;
+    const depth = closed[i] - L[i];
+    // assez creusé par rapport aux voisins, et nettement plus proche du noir que de sa zone
+    if (depth > 14 && L[i] < Ld + 0.6 * (labOf[labels[i]][0] - Ld)) labels[i] = dark;
+  }
+  // inverse : déliés clairs sur fond sombre (calligraphie dorée sur noir…). Les pixels mêlés
+  // au noir sont rendus à la couleur claire la plus proche plutôt qu'au fond.
+  const opened = rankFilter(rankFilter(L, w, h, 2, false), w, h, 2, true);
+  const others = present.filter((l) => l !== dark && labOf[l][0] > Ld + 20);
+  if (!others.length) return;
+  for (let i = 0; i < N; i++) {
+    if (labels[i] !== dark) continue;
+    const rise = L[i] - opened[i];
+    if (rise <= 8 || L[i] < Ld + 7) continue;
+    // couleur claire la plus proche en teinte (on compare a/b normalisés, la luminance étant atténuée)
+    const c = lab[i];
+    let best = -1, bd = Infinity, bt = 0;
+    for (const l of others) {
+      const q = labOf[l];
+      const t = Math.max(0.1, Math.min(1, (c[0] - Ld) / (q[0] - Ld)));
+      const d = Math.hypot(c[1] - q[1] * t, c[2] - q[2] * t);
+      if (d < bd) { bd = d; best = l; bt = t; }
+    }
+    // la teinte doit correspondre (un grain gris du fond ne devient pas un fil coloré)
+    const qc = best >= 0 ? Math.hypot(labOf[best][1], labOf[best][2]) * bt : 0;
+    const pc = Math.hypot(c[1], c[2]);
+    const hueOk = qc < 6 ? pc < 8 : pc > qc * 0.45;
+    if (best >= 0 && bd < 6 + 22 * bt && hueOk) labels[i] = best;
+  }
+}
+
+/**
+ * Rebouche les fissures fines laissées par le retrait du fond (rayures, ombres fines) :
+ * un pixel de fond encadré à moins de `r` pixels par la même couleur des deux côtés reprend cette couleur.
+ */
+function fillCracks(labels: Int16Array, w: number, h: number, r: number) {
+  const src = labels.slice();
+  const dirs = [[1, 0], [0, 1], [1, 1], [1, -1]];
+  const at = (x: number, y: number) => (x < 0 || y < 0 || x >= w || y >= h ? -2 : src[y * w + x]);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    if (src[y * w + x] !== -1) continue;
+    for (const [dx, dy] of dirs) {
+      let a = -1, b = -1;
+      for (let k = 1; k <= r && a === -1; k++) a = at(x + dx * k, y + dy * k);
+      for (let k = 1; k <= r && b === -1; k++) b = at(x - dx * k, y - dy * k);
+      if (a >= 0 && a === b) { labels[y * w + x] = a; break; }
+    }
+  }
 }
 
 /** Retire la couleur de fond uniquement là où elle est reliée au bord de l'image. */
@@ -346,7 +455,7 @@ function modeFilter(src: Int16Array, w: number, h: number, k: number): Int16Arra
 }
 
 /** Fusionne les petites taches avec la couleur voisine majoritaire. */
-function removeSmall(labels: Int16Array, w: number, h: number, minPx: number) {
+function removeSmall(labels: Int16Array, w: number, h: number, minPx: number, labOf?: Lab[], keepPx = Infinity) {
   const N = w * h;
   const comp = new Int32Array(N).fill(-1);
   const stack: number[] = [];
@@ -372,7 +481,9 @@ function removeSmall(labels: Int16Array, w: number, h: number, minPx: number) {
         }
       }
       const best = [...cnt.entries()].sort((a, b) => b[1] - a[1])[0];
-      if (best) for (const p of members) labels[p] = best[0];
+      // petit détail très contrasté (œil, reflet) : on le garde s'il n'est pas minuscule
+      const contrast = best && labOf && lab >= 0 && best[0] >= 0 ? dist3(labOf[lab], labOf[best[0]]) : 0;
+      if (best && !(contrast > 30 && members.length >= keepPx)) for (const p of members) labels[p] = best[0];
     }
     id++;
   }
@@ -689,6 +800,135 @@ function orderPaths<T extends { pts: Pt[]; closed: boolean }>(paths: T[]): T[] {
   return out;
 }
 
+export interface LinePiece { kind: 'satin' | 'run'; pts: Pt[]; closed: boolean }
+
+/**
+ * Sépare d'un masque les composantes longues et fines (traits, liserés, calligraphie).
+ * Chaque trait devient un satin dont les deux bords suivent exactement la forme (largeur variable),
+ * ou un point triple s'il est très fin. Un trait mal couvert reste un remplissage classique.
+ * Retourne le masque des zones restantes à remplir.
+ */
+function extractLines(mask: Uint8Array, w: number, h: number, mmPerPx: number, o: AutoOptions,
+  emit: (pieces: LinePiece[]) => void): Uint8Array {
+  const rest = mask.slice();
+  const comp = new Int32Array(w * h).fill(-1);
+  const stack: number[] = [];
+  const minPx = Math.max(4, o.minAreaMm2 / (mmPerPx * mmPerPx) * 0.5);
+  const stepPx = 0.2 / mmPerPx;            // une piqûre tous les 0,2 mm de chaque côté → 0,4 mm par aller-retour
+  const pull = 0.1 / mmPerPx;              // compensation de traction
+  for (let s0 = 0; s0 < w * h; s0++) {
+    if (!mask[s0] || comp[s0] >= 0) continue;
+    const px: number[] = [];
+    let minX = w, minY = h, maxX = 0, maxY = 0, edges = 0;
+    stack.push(s0); comp[s0] = s0;
+    while (stack.length) {
+      const p = stack.pop()!;
+      px.push(p);
+      const x = p % w, y = (p / w) | 0;
+      if (x < minX) minX = x; if (x > maxX) maxX = x; if (y < minY) minY = y; if (y > maxY) maxY = y;
+      for (const [q, ok] of [[p - 1, x > 0], [p + 1, x < w - 1], [p - w, y > 0], [p + w, y < h - 1]] as [number, boolean][]) {
+        if (!ok || !mask[q]) { edges++; continue; }
+        if (comp[q] < 0) { comp[q] = s0; stack.push(q); }
+      }
+    }
+    if (px.length < minPx) continue;
+    const widthMm = ((2 * px.length) / edges) * mmPerPx;
+    if (widthMm >= o.satinWidth) continue;
+    // recadrer
+    const cw = maxX - minX + 3, chh = maxY - minY + 3;
+    const sub = new Uint8Array(cw * chh);
+    for (const p of px) sub[((((p / w) | 0) - minY + 1) * cw) + (p % w) - minX + 1] = 1;
+    const inside = (x: number, y: number) => {
+      const xi = Math.floor(x), yi = Math.floor(y);
+      return xi >= 0 && yi >= 0 && xi < cw && yi < chh && sub[yi * cw + xi] === 1;
+    };
+    const lines = centerlines(sub, cw, chh);
+    const len = lines.reduce((t, l) => t + polyLength(l.pts, l.closed), 0);
+    const wPx = px.length / Math.max(1, len);
+    if (len < 3 * wPx) continue; // tache compacte : reste un remplissage
+    const maxD = Math.max(3, wPx * 2.5);
+    const march = (c: Pt, d: Pt) => {
+      let t = 0;
+      while (t < maxD && inside(c.x + d.x * (t + 0.25), c.y + d.y * (t + 0.25))) t += 0.25;
+      return t;
+    };
+    const covered = new Int32Array(cw * chh);
+    let pieceId = 0, overlap = 0;
+    const cover = (a: Pt, b: Pt) => {
+      const n = Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) * 2) + 1;
+      for (let k = 0; k <= n; k++) {
+        const x = Math.floor(a.x + ((b.x - a.x) * k) / n), y = Math.floor(a.y + ((b.y - a.y) * k) / n);
+        for (const [dx, dy] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) {
+          const xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= cw || yy >= chh) continue;
+          const j = yy * cw + xx, v = covered[j];
+          if (v && v !== pieceId && dx === 0 && dy === 0 && sub[j]) { overlap++; covered[j] = -1; }
+          else if (!v) covered[j] = pieceId;
+        }
+      }
+    };
+    const pieces: LinePiece[] = [];
+    const veryThin = wPx * mmPerPx < 0.55;
+    for (const l of lines) {
+      pieceId++;
+      let pts = l.closed ? smoothLoop(l.pts.slice(0, -1), o.smooth) : smoothOpen(l.pts, o.smooth);
+      if (pts.length < 2) continue;
+      // prolonger les extrémités jusqu'au bord du trait (l'amincissement les raccourcit)
+      if (!l.closed) {
+        const ext = (end: Pt, prev: Pt) => {
+          const L = Math.hypot(end.x - prev.x, end.y - prev.y) || 1;
+          const d = { x: (end.x - prev.x) / L, y: (end.y - prev.y) / L };
+          const t = Math.max(0, march(end, d) - 0.25);
+          return { x: end.x + d.x * t, y: end.y + d.y * t };
+        };
+        const k = Math.min(pts.length - 1, 3);
+        pts = [ext(pts[0], pts[k]), ...pts, ext(pts[pts.length - 1], pts[pts.length - 1 - k])];
+      }
+      const path = resample(pts, Math.max(0.3, stepPx), l.closed);
+      if (path.length < 2) continue;
+      if (veryThin) {
+        for (let i = 1; i < path.length; i++) cover(path[i - 1], path[i]);
+        pieces.push({ kind: 'run', pts: path, closed: l.closed });
+        continue;
+      }
+      // normales lissées, rayons jusqu'aux deux bords
+      const n = path.length;
+      const Lp: Pt[] = [], Rp: Pt[] = [];
+      for (let i = 0; i < n; i++) {
+        const a = path[l.closed ? (i - 3 + n) % n : Math.max(0, i - 3)], b = path[l.closed ? (i + 3) % n : Math.min(n - 1, i + 3)];
+        const tl = Math.hypot(b.x - a.x, b.y - a.y) || 1;
+        const nx = -(b.y - a.y) / tl, ny = (b.x - a.x) / tl;
+        const c = path[i];
+        const ml = march(c, { x: nx, y: ny }), mr = march(c, { x: -nx, y: -ny });
+        // compensation proportionnelle à la largeur : les pointes restent pointues
+        const pc = pull * Math.min(1, ((ml + mr) * mmPerPx) / 1.2);
+        const dl = Math.max(0.05 / mmPerPx, ml + pc), dr = Math.max(0.05 / mmPerPx, mr + pc);
+        Lp.push({ x: c.x + nx * dl, y: c.y + ny * dl });
+        Rp.push({ x: c.x - nx * dr, y: c.y - ny * dr });
+        cover(Lp[i], Rp[i]);
+      }
+      // sous-couche centrale (traits larges), puis satin en revenant
+      const out: Pt[] = [];
+      const order = [...Array(n).keys()];
+      if (wPx * mmPerPx > 1.3) {
+        const under = resample(path, 2 / mmPerPx, l.closed);
+        out.push(...under);
+        order.reverse();
+      }
+      order.forEach((i, k) => out.push(k % 2 === 0 ? Lp[i] : Rp[i]));
+      pieces.push({ kind: 'satin', pts: out, closed: false });
+    }
+    // couverture insuffisante : on garde le remplissage d'origine pour ce trait
+    let miss = 0;
+    for (let i = 0; i < sub.length; i++) if (sub[i] && !covered[i]) miss++;
+    if (!pieces.length || miss > px.length * 0.18 || overlap > px.length * 0.12) continue;
+    const off = (q: Pt): Pt => ({ x: q.x + minX - 1, y: q.y + minY - 1 });
+    emit(pieces.map((pc) => ({ ...pc, pts: pc.pts.map(off) })));
+    for (const p of px) rest[p] = 0;
+  }
+  return rest;
+}
+
 export interface AutoResult { objects: EmbObject[]; threads: Thread[] }
 
 export function autoDigitize(q: Quantized, o: AutoOptions, threadBase: number): AutoResult {
@@ -743,6 +983,28 @@ export function autoDigitize(q: Quantized, o: AutoOptions, threadBase: number): 
     for (const p of orderPaths(paths)) objects.push(lineObj(p.pts, p.closed, ci, name));
   };
 
+  /** Contour extérieur complet (silhouette + trous), dans la couleur et l'épaisseur choisies. */
+  const addOuter = () => {
+    if (!o.outer || !used.length) return;
+    let ci: number;
+    if (o.outerThread) { threads.push({ ...o.outerThread }); ci = threadBase + threads.length - 1; }
+    else ci = threadFor(darkest);
+    const loops = traceMask(maskOf((l) => l >= 0), w, h).map((p) => smoothLoop(p, Math.max(1, o.smooth)).map(toMm));
+    const paths = loops.filter((l) => Math.abs(signedArea(l)) >= Math.max(1, o.minAreaMm2)).map((pts) => ({ pts, closed: true }));
+    for (const p of orderPaths(paths)) {
+      if (o.outerStitch === 'satin') {
+        const sat = makeSatin(p.pts, o.outerWidth, true, ci);
+        sat.satin.underlay = o.outerWidth > 1.6 ? 'center' : 'none';
+        sat.name = 'Contour extérieur';
+        objects.push(sat);
+      } else {
+        const r = makeRun(p.pts, true, ci);
+        r.run.repeats = o.outerStitch === 'triple' ? 3 : 1; r.run.length = 2; r.name = 'Contour extérieur';
+        objects.push(r);
+      }
+    }
+  };
+
   if (o.render === 'outline') {
     if (o.outlineColor === 'lines' && darkest >= 0) {
       // les traits foncés de l'image deviennent une ligne centrale ; les autres limites sont gardées
@@ -763,33 +1025,77 @@ export function autoDigitize(q: Quantized, o: AutoOptions, threadBase: number): 
         for (const p of orderPaths(paths)) objects.push(lineObj(p.pts, true, ci, `Contour ${li + 1}`));
       });
     }
+    addOuter();
     return { objects, threads };
   }
 
+  const finish: EmbObject[] = []; // traits de finition, brodés en dernier
+  const finishZones: EmbObject[] = []; // zones de la couleur des traits, juste avant eux (un seul passage de cette couleur)
   used.forEach((lab, li) => {
     const ci = threadFor(lab);
-    const loops = traceMask(maskOf((l) => l === lab), w, h).map((p) => smoothLoop(p, o.smooth).map(toMm));
+    let mask: Uint8Array = maskOf((l) => l === lab);
+    if (o.lineSatin) {
+      // les traits (zones longues et fines) : satin qui épouse les bords, ou point triple
+      const items: { ob: EmbObject; pts: Pt[]; closed: boolean; first: Pt }[] = [];
+      mask = extractLines(mask, w, h, mmPerPx, o, (pieces) => {
+        for (const pc of pieces) {
+          const mm = pc.pts.map(toMm);
+          if (mm.length < 2) continue;
+          let ob: EmbObject;
+          if (pc.kind === 'run') {
+            const r = makeRun(mm, pc.closed, ci);
+            r.run.repeats = 3; r.run.length = 2;
+            ob = r;
+          } else {
+            ob = { id: uid(), kind: 'stitches', name: '', color: ci, visible: true, locked: false, tie: true,
+              stitches: mm.map((q, i) => ({ ...q, cmd: i === 0 ? Cmd.JUMP : Cmd.STITCH })) };
+          }
+          ob.name = `Trait ${li + 1}`;
+          const ends = [mm[0], mm[mm.length - 1]];
+          items.push({ ob, pts: ends, closed: pc.closed, first: ends[0] });
+        }
+      });
+      const ordered = orderPaths(items).map((it) => {
+        if (it.pts[0] !== it.first) {
+          // parcourir le trait dans l'autre sens
+          if (it.ob.kind === 'run') it.ob.points.reverse();
+          else if (it.ob.kind === 'stitches') { it.ob.stitches.reverse(); it.ob.stitches.forEach((q, i) => (q.cmd = i === 0 ? Cmd.JUMP : Cmd.STITCH)); }
+        }
+        return it.ob;
+      });
+      (o.linesLast && lab === darkest ? finish : objects).push(...ordered);
+    }
+    const loops = traceMask(mask, w, h).map((p) => smoothLoop(p, o.smooth).map(toMm));
     const islands = splitIslands(normalize(loops));
     const ordered = orderIslands(islands);
     for (const isl of ordered) {
       const a = isl.reduce((s, p) => s + signedArea(p), 0);
-      if (Math.abs(a) < o.minAreaMm2 * 0.5) continue;
+      if (Math.abs(a) < Math.min(0.3, o.minAreaMm2 * 0.5)) continue; // le bruit a déjà été retiré à la quantification
       const per = isl.reduce((s, p) => s + polyLength(p, true), 0);
       const width = (2 * Math.abs(a)) / per;
       const obj = makeFill(isl, ci, `Zone ${li + 1}`);
-      if (width < o.satinWidth) {
+      // satin d'un seul angle : seulement si les piqûres restent courtes (forme étroite ET droite).
+      // Une forme courbe (arc, pétale) donnerait de longues piqûres en biais : tatami uni à la place.
+      const pa = principalAngle(isl[0]);
+      const nx = -Math.sin(pa), ny = Math.cos(pa);
+      let lo = Infinity, hi = -Infinity;
+      for (const q of isl[0]) { const v = q.x * nx + q.y * ny; if (v < lo) lo = v; if (v > hi) hi = v; }
+      if (width < o.satinWidth && hi - lo <= Math.max(o.satinWidth * 1.5, width * 2.2)) {
         obj.fill.pattern = 'satin';
-        obj.fill.angle = Math.round(((principalAngle(isl[0]) * 180) / Math.PI + 90 + 360) % 180);
+        obj.fill.angle = Math.round(((pa * 180) / Math.PI + 90 + 360) % 180);
         obj.fill.underlay = width > 1.5 ? 'center' : 'none';
         obj.fill.pullComp = 0.15;
         obj.name = `Satin ${li + 1}`;
       } else {
+        // un seul angle par couleur : remplissage uni d'une zone à l'autre
         obj.fill.angle = angles[li % angles.length];
-        obj.fill.underlay = width > 6 ? 'edge+tatami' : 'edge';
+        obj.fill.underlay = width > 6 ? 'edge+tatami' : width > 1.5 ? 'edge' : 'none';
+        obj.fill.spacing = 0.4;
       }
-      objects.push(obj);
+      (o.linesLast && lab === darkest ? finishZones : objects).push(obj);
     }
   });
+  objects.push(...finishZones, ...finish);
   const contour = o.contour ?? (o.outline ? 'silhouette' : 'none');
   if (contour === 'all' && darkest >= 0) allBoundaries(threadFor(darkest), 'Contour');
   if (contour === 'silhouette' && darkest >= 0) {
@@ -800,6 +1106,7 @@ export function autoDigitize(q: Quantized, o: AutoOptions, threadBase: number): 
       objects.push(lineObj(l, true, ci, 'Contour'));
     }
   }
+  addOuter();
   return { objects, threads };
 }
 

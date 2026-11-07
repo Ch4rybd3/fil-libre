@@ -6,10 +6,11 @@ import type { Design, EmbObject, Thread } from '../core/types';
 import { Cmd } from '../core/types';
 import { autoDigitize, crossStitch, defaultAuto, imageToData, labToRgb, photoStitch, quantize, threadsOf, unifyThreads, workSize, type AutoOptions, type Quantized } from '../digitize/autodigitize';
 import { exportDesign, importedToObjects, readMachineFile, type ExportFormat } from '../formats';
-import { estimateMinutes } from '../core/plan';
+import { buildPlan, estimateMinutes, forgetObjects } from '../core/plan';
 import { HOOPS, makeSatin, makeText, shapePoints, uid, type ShapeKind } from '../core/defaults';
 import { allFonts, fontInfo, fontUrl, SCRIPT_NAMES, type FontInfo, type Script } from '../core/text';
 import { designName } from '../formats/encode';
+import { addOutlines, outlinable, type OutlineOptions } from './actions';
 
 // ------------------------------------------------------------------ Nuancier
 
@@ -161,6 +162,8 @@ export async function autoDigitizeDialog(file?: File) {
   const selected = new Set<number>();
   let keepBg = false;
   let timer = 0;
+  let view: 'zones' | 'real' = 'zones';
+  let bgAuto = true, bgInside: HTMLElement | null = null;
   let cur: { q: Quantized; shown: Quantized; threads: (Thread | null)[]; shownOf: Map<number, number> } | null = null;
   let data: ImageData | null = null, dataKey = '';
   const work = () => {
@@ -205,15 +208,16 @@ export async function autoDigitizeDialog(file?: File) {
   const draw = () => {
     if (!cur) return;
     const { shown: q, threads } = cur;
-    preview.width = q.w; preview.height = q.h;
+    const zones = view === 'zones';
     const ctx = preview.getContext('2d')!;
-    const out = ctx.createImageData(q.w, q.h);
+    if (zones) { preview.width = q.w; preview.height = q.h; }
+    const out = zones ? ctx.createImageData(q.w, q.h) : null;
     const colOf = (l: number) => threads[l] ?? q.palette[l];
     const lum = (c: { r: number; g: number; b: number }) => 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
     const used = [...new Set(Array.from(q.labels).filter((l) => l >= 0))];
     const darkest = used.length ? used.reduce((a, b) => (lum(colOf(a)) < lum(colOf(b)) ? a : b)) : -1;
     const W = q.w;
-    for (let i = 0; i < q.w * q.h; i++) {
+    if (out) for (let i = 0; i < q.w * q.h; i++) {
       const l = q.labels[i];
       const checker = ((i % W) >> 3) % 2 === (((i / W) | 0) >> 3) % 2 ? { r: 235, g: 235, b: 235 } : { r: 250, g: 250, b: 250 };
       let c = l >= 0 ? colOf(l) : checker;
@@ -229,9 +233,15 @@ export async function autoDigitizeDialog(file?: File) {
         }
         else if (edge) c = colOf(darkest);
       }
+      if (o.outer && l >= 0) {
+        const x = i % W;
+        const border = x === 0 || x === W - 1 || i < W || i + W >= q.labels.length || q.labels[i - 1] < 0 || q.labels[i + 1] < 0 || q.labels[i - W] < 0 || q.labels[i + W] < 0;
+        if (border) c = o.outerThread ?? colOf(darkest);
+      }
       out.data[i * 4] = c.r; out.data[i * 4 + 1] = c.g; out.data[i * 4 + 2] = c.b; out.data[i * 4 + 3] = 255;
     }
-    ctx.putImageData(out, 0, 0);
+    if (out) ctx.putImageData(out, 0, 0);
+    else scheduleReal();
     // palette : une pastille par bobine
     clear(swatches);
     const total = used.reduce((s, l) => s + q.counts[l], 0) || 1;
@@ -257,6 +267,40 @@ export async function autoDigitizeDialog(file?: File) {
     const raw = new Set(Array.from(cur.q.labels).filter((l) => l >= 0)).size;
     info.textContent = `${o.widthMm} × ${Math.round(o.widthMm * ratio)} mm — ${used.length} bobine(s)` +
       (raw > used.length ? ` (${raw} nuances, réunies quand elles tombent sur le même fil)` : '') + (o.groups.length ? ` — ${o.groups.length} regroupement(s) manuel(s)` : '');
+    baseInfo = info.textContent;
+    if (!zones) info.textContent = baseInfo + ' — calcul du rendu brodé…';
+  };
+  /** Aperçu réel : génère la broderie avec les réglages actuels et dessine les points. */
+  let realTimer = 0, baseInfo = '';
+  const scheduleReal = () => {
+    clearTimeout(realTimer);
+    realTimer = window.setTimeout(() => {
+      if (!cur || view !== 'real') return;
+      const q2 = { ...cur.q, labels: cur.q.labels.slice() };
+      const res = autoDigitize(q2, o, 0);
+      const d: Design = { ...app.design, threads: res.threads, objects: res.objects };
+      const plan = buildPlan(d);
+      forgetObjects(res.objects.map((x) => x.id));
+      const Wmm = o.widthMm, Hmm = cur.q.h * cur.q.mmPerPx;
+      const k = Math.min(10, 1100 / Math.max(Wmm, Hmm));
+      preview.width = Math.round(Wmm * k); preview.height = Math.round(Hmm * k);
+      const ctx = preview.getContext('2d')!;
+      ctx.fillStyle = app.design.fabric; ctx.fillRect(0, 0, preview.width, preview.height);
+      ctx.setTransform(k, 0, 0, k, (Wmm / 2) * k, (Hmm / 2) * k);
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+      let prev: { x: number; y: number } | null = null;
+      for (const st of plan.stitches) {
+        if (st.cmd === Cmd.STITCH && prev) {
+          const t = res.threads[st.color] ?? res.threads[0];
+          ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(st.x, st.y);
+          ctx.lineWidth = 0.42; ctx.strokeStyle = `rgb(${t.r * 0.55 | 0},${t.g * 0.55 | 0},${t.b * 0.55 | 0})`; ctx.stroke();
+          ctx.lineWidth = 0.3; ctx.strokeStyle = `rgb(${t.r},${t.g},${t.b})`; ctx.stroke();
+        }
+        if (st.cmd === Cmd.STITCH || st.cmd === Cmd.JUMP) prev = st;
+      }
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      info.textContent = `${baseInfo} — ${plan.stitchCount.toLocaleString('fr-FR')} points, ${plan.colorChanges} changement(s) de fil, ≈ ${Math.ceil(estimateMinutes(plan))} min`;
+    }, 350);
   };
   const update = () => {
     clearTimeout(timer);
@@ -268,6 +312,13 @@ export async function autoDigitizeDialog(file?: File) {
       for (const l of shown.labels) if (l >= 0) shown.counts[l]++;
       const shownOf = new Map<number, number>();
       for (let i = 0; i < q.labels.length; i++) if (q.labels[i] >= 0 && !shownOf.has(q.labels[i])) shownOf.set(q.labels[i], shown.labels[i]);
+      // logo sur fond foncé : les intérieurs de lettres et de boucles sont du fond, pas des détails à broder
+      if (bgAuto && o.bgOutsideOnly && q.bgLabel >= 0 && q.lab[q.bgLabel][0] < 30) {
+        bgAuto = false; o.bgOutsideOnly = false;
+        const cb = bgInside?.querySelector('input'); if (cb) cb.checked = false;
+        update(); return;
+      }
+      bgAuto = false;
       cur = { q, shown, threads: threadsOf(q, o.threadChart), shownOf };
       draw();
     }, 180);
@@ -277,8 +328,10 @@ export async function autoDigitizeDialog(file?: File) {
     clear(extra);
     if (o.render === 'fill') {
       add(extra,
-        numField('Satin si plus fin que', o.satinWidth, (v) => { o.satinWidth = v; }, { min: 0, max: 10, step: 0.5, unit: 'mm', title: 'Les zones étroites sont brodées en satin, les larges en tatami' }),
-        selectField('Contour par-dessus', o.contour, [['none', 'Aucun'], ['silhouette', 'Silhouette extérieure'], ['all', 'Toutes les limites entre couleurs']], (v) => { o.contour = v; renderExtra(); draw(); }, 'Contour brodé dans la couleur la plus foncée'),
+        numField('Satin si plus fin que', o.satinWidth, (v) => { o.satinWidth = v; draw(); }, { min: 0, max: 10, step: 0.5, unit: 'mm', title: 'Les zones étroites sont brodées en satin, les larges en tatami' }),
+        checkField('Traits fins en satin qui suit le trait', o.lineSatin, (v) => { o.lineSatin = v; draw(); }, 'Les zones longues et étroites (contours, liserés) deviennent une colonne satin le long de leur ligne centrale au lieu d’un remplissage'),
+        checkField('Traits foncés en dernier (finition)', o.linesLast, (v) => { o.linesLast = v; draw(); }, 'Les traits de la couleur la plus foncée sont brodés à la fin, par-dessus les couleurs, pour un contour net'),
+        selectField('Contour par-dessus', o.contour === 'silhouette' ? 'none' : o.contour, [['none', 'Aucun'], ['all', 'Toutes les limites entre couleurs']], (v) => { o.contour = v; renderExtra(); draw(); }, 'Contour brodé dans la couleur la plus foncée'),
       );
     } else {
       add(extra, selectField('Contours', o.outlineColor, [
@@ -286,11 +339,26 @@ export async function autoDigitizeDialog(file?: File) {
         '« Suivre les traits » : pour un dessin déjà cerné de noir, brode le milieu de chaque trait (une seule ligne). « Limites » : brode une fois chaque frontière entre deux couleurs. « Chaque zone » : entoure chaque zone dans sa propre couleur.'));
     }
     if (o.render === 'outline' || o.contour !== 'none') {
-      add(extra, selectField('Point du contour', o.outlineStitch, [['triple', 'Point triple'], ['simple', 'Point avant simple'], ['satin', 'Satin']], (v) => { o.outlineStitch = v; renderExtra(); }));
-      if (o.outlineStitch === 'satin') add(extra, numField('Largeur du satin', o.outlineWidth, (v) => { o.outlineWidth = v; }, { min: 0.8, max: 6, step: 0.1, unit: 'mm' }));
+      add(extra, selectField('Point du contour', o.outlineStitch, [['triple', 'Point triple'], ['simple', 'Point avant simple'], ['satin', 'Satin']], (v) => { o.outlineStitch = v; renderExtra(); draw(); }));
+      if (o.outlineStitch === 'satin') add(extra, numField('Largeur du satin', o.outlineWidth, (v) => { o.outlineWidth = v; draw(); }, { min: 0.8, max: 6, step: 0.1, unit: 'mm' }));
     }
   };
   renderExtra();
+  const outerBox = h('div', {});
+  const renderOuter = () => {
+    clear(outerBox);
+    add(outerBox, checkField('Fermer le motif par un contour complet', o.outer, (v) => { o.outer = v; renderOuter(); draw(); }, 'Brode tout le tour du motif (et des trous) en dernier, pour une finition nette'));
+    if (!o.outer) return;
+    const t = o.outerThread;
+    const colorBtn = h('button', { class: 'colorpick', onclick: () => threadPicker((th) => { o.outerThread = th; renderOuter(); draw(); }, 'Couleur du contour extérieur') },
+      h('i', { style: { background: t ? rgbOf(t) : 'repeating-linear-gradient(45deg,#222 0 4px,#555 4px 8px)' } }), t ? `${t.code} ${t.name}` : 'La plus foncée du motif');
+    add(outerBox,
+      h('label', { class: 'field' }, h('span', {}, 'Couleur'), h('span', { class: 'inp' }, colorBtn, t ? h('button', { class: 'linkbtn', onclick: () => { o.outerThread = null; renderOuter(); draw(); } }, 'auto') : null)),
+      selectField('Point', o.outerStitch, [['satin', 'Satin'], ['triple', 'Point triple'], ['simple', 'Point avant simple']], (v) => { o.outerStitch = v; renderOuter(); draw(); }),
+      o.outerStitch === 'satin' ? numField('Épaisseur', o.outerWidth, (v) => { o.outerWidth = v; draw(); }, { min: 0.6, max: 8, step: 0.1, unit: 'mm', title: 'Fin : 0,8–1,2 mm ; bordure marquée : 2–4 mm' }) : null,
+    );
+  };
+  renderOuter();
   const sec = (t: string) => h('h4', { class: 'sec' }, t);
   const controls = h('div', { class: 'controls' },
     sec('Taille'),
@@ -302,13 +370,16 @@ export async function autoDigitizeDialog(file?: File) {
     rangeField('Fusionner les nuances proches', o.mergeDE, 0, 40, 1, (v) => { o.mergeDE = v; update(); }, (v) => (v ? (v < 10 ? 'léger' : v < 20 ? 'moyen' : 'fort') + ` (${v})` : 'non')),
     selectField('Fils', o.threadChart, [['Janome/Elna', 'Nuancier Janome/Elna'], ['Brother', 'Nuancier Brother'], ['exact', 'Couleurs exactes de l\'image']], (v) => { o.threadChart = v; update(); }),
     checkField('Retirer le fond', o.removeBg, (v) => { o.removeBg = v; update(); }, 'La couleur dominante sur les bords de l\'image n\'est pas brodée'),
-    checkField('…seulement à l\'extérieur du motif', o.bgOutsideOnly, (v) => { o.bgOutsideOnly = v; update(); }, 'Garde les zones de la couleur du fond entourées par le dessin (yeux, griffes, reflets blancs…)'),
+    bgInside = checkField('…seulement à l\'extérieur du motif', o.bgOutsideOnly, (v) => { o.bgOutsideOnly = v; bgAuto = false; update(); }, 'Garde les zones de la couleur du fond entourées par le dessin (yeux, griffes, reflets blancs…)'),
+    checkField('Préserver les traits fins', o.keepLines, (v) => { o.keepLines = v; update(); }, 'Repère les traits sombres très fins (adoucis par l’anticrénelage) et les garde dans la couleur des traits'),
     checkField('Réduire le bruit', o.denoise, (v) => { o.denoise = v; update(); }, 'Lisse les dégradés et artefacts JPEG sans baver sur les contours'),
     sec('Rendu'),
     selectField('Type', o.render, [['fill', 'Remplissage (zones pleines)'], ['outline', 'Contours seulement (sans remplissage)']], (v) => { o.render = v; renderExtra(); draw(); }),
     extra,
-    rangeField('Lissage des contours', o.smooth, 0, 3, 1, (v) => { o.smooth = v; }),
+    rangeField('Lissage des contours', o.smooth, 0, 3, 1, (v) => { o.smooth = v; draw(); }),
     numField('Ignorer les zones <', o.minAreaMm2, (v) => { o.minAreaMm2 = v; update(); }, { min: 0, max: 50, step: 0.5, unit: 'mm²' }),
+    sec('Contour extérieur'),
+    outerBox,
     checkField('Garder l\'image en fond (pour retoucher)', keepBg, (v) => { keepBg = v; }),
   );
   const toggleOrig = h('button', { class: 'linkbtn', onclick: () => {
@@ -317,7 +388,13 @@ export async function autoDigitizeDialog(file?: File) {
     preview.style.display = show ? 'none' : '';
     toggleOrig.textContent = show ? 'Voir le résultat' : 'Voir l\'image d\'origine';
   } }, 'Voir l\'image d\'origine');
+  const viewBtns = h('div', { class: 'seg' },
+    (['zones', 'real'] as const).map((v) => h('button', {
+      class: v === view ? 'on' : '', title: v === 'real' ? 'Génère les points avec les réglages actuels : exactement ce que brodera la machine' : 'Zones de couleur détectées (rapide)',
+      onclick: (e: Event) => { view = v; viewBtns.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b === e.currentTarget)); draw(); },
+    }, v === 'zones' ? 'Zones de couleur' : 'Rendu brodé (réel)')));
   const side = h('div', { class: 'pv' },
+    viewBtns,
     h('div', { class: 'pv-img' }, preview, original), toggleOrig, info,
     h('div', { class: 'pal-box' },
       h('div', { class: 'pal-head' }, h('b', {}, 'Bobines'), h('small', {}, 'Cliquez sur des pastilles (ou dans l\'image) pour les sélectionner')),
@@ -546,6 +623,54 @@ table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid #ddd;pad
   if (!w) { download(designName(d) + '-fiche.html', html, 'text/html'); return; }
   w.document.write(html);
   w.document.close();
+}
+
+// ------------------------------------------------------------------ Contour des formes
+
+export function outlineDialog() {
+  const selCount = app.selected().filter(outlinable).length;
+  const lum = (t: Thread) => 0.299 * t.r + 0.587 * t.g + 0.114 * t.b;
+  const threads = app.design.threads;
+  const darkest = threads.reduce((a, t, i) => (lum(t) < lum(threads[a]) ? i : a), 0);
+  const op: OutlineOptions = { scope: selCount ? 'selection' : 'all', mode: 'each', color: darkest, stitch: 'satin', width: 1, offset: 0, placement: 'end' };
+  let newThread: Thread | null = null;
+  const sw = h('div', { class: 'mini-swatches' });
+  const renderSw = () => {
+    clear(sw);
+    threads.forEach((t, i) => sw.appendChild(h('button', { class: !newThread && op.color === i ? 'on' : '', title: `${t.code} ${t.name}`, style: { background: rgbOf(t) }, onclick: () => { op.color = i; newThread = null; renderSw(); } })));
+    if (newThread) sw.appendChild(h('button', { class: 'on', title: `${newThread.code} ${newThread.name}`, style: { background: rgbOf(newThread) } }));
+    sw.appendChild(h('button', { title: 'Autre fil…', onclick: () => threadPicker((t) => { newThread = t; renderSw(); }) }, '+'));
+  };
+  renderSw();
+  const widthBox = h('div', {});
+  const renderW = () => {
+    clear(widthBox);
+    if (op.stitch === 'satin') widthBox.appendChild(numField('Épaisseur', op.width, (v) => { op.width = v; }, { min: 0.6, max: 8, step: 0.1, unit: 'mm', title: 'Fin : 0,8–1,2 mm ; bordure marquée : 2–4 mm' }));
+  };
+  renderW();
+  modal('Ajouter un contour', h('div', { class: 'controls' },
+    selectField('Formes', op.scope, [['selection', `La sélection (${selCount} forme${selCount > 1 ? 's' : ''})`], ['all', 'Toutes les formes du motif']], (v) => { op.scope = v; }),
+    selectField('Contour', op.mode, [['each', 'Autour de chaque forme'], ['union', 'Autour de l’ensemble (silhouette)']], (v) => { op.mode = v; }),
+    h('label', { class: 'field' }, h('span', {}, 'Couleur'), sw),
+    selectField('Point', op.stitch, [['satin', 'Satin'], ['triple', 'Point triple'], ['simple', 'Point avant simple']], (v) => { op.stitch = v; renderW(); }),
+    widthBox,
+    numField('Décalage vers l’extérieur', op.offset, (v) => { op.offset = v; }, { min: 0, max: 20, step: 0.5, unit: 'mm', title: '0 = sur le bord de la forme ; plus = effet « écho » autour' }),
+    selectField('Ordre de broderie', op.placement, [['end', 'Tous les contours à la fin (finition)'], ['after', 'Juste après chaque forme']], (v) => { op.placement = v; }),
+  ), [
+    { label: 'Annuler', onClick: () => {} },
+    {
+      label: 'Ajouter', primary: true, onClick: () => {
+        if (op.scope === 'selection' && !selCount) { toast('Sélectionnez au moins une forme', 'error'); return false; }
+        if (newThread) {
+          const nt = newThread;
+          const i = threads.findIndex((t) => t.code === nt.code && t.chart === nt.chart && t.r === nt.r);
+          if (i >= 0) op.color = i; else { threads.push(nt); op.color = threads.length - 1; }
+        }
+        const n = addOutlines(op);
+        if (n) toast(`${n} contour(s) ajouté(s)`);
+      },
+    },
+  ]);
 }
 
 // ------------------------------------------------------------------ Monogramme

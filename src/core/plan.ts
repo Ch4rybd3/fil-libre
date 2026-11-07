@@ -21,6 +21,9 @@ export const defaultPlanOptions: PlanOptions = { trimDistance: 3 };
 
 const cache = new Map<string, { key: string; st: Stitch[] }>();
 
+/** Libère le cache des points d'objets temporaires (aperçus). */
+export function forgetObjects(ids: string[]) { for (const id of ids) cache.delete(id); }
+
 function asStitches(pts: Pt[]): Stitch[] {
   return pts.map((p, i) => ({ x: p.x, y: p.y, cmd: i === 0 ? Cmd.JUMP : Cmd.STITCH }));
 }

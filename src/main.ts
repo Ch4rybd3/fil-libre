@@ -3,6 +3,7 @@ import { app, restoreAutosave } from './ui/state';
 import { Renderer } from './ui/renderer';
 import { Tools, isTyping } from './ui/tools';
 import { h, download, pickFile, toast, modal } from './ui/dom';
+import { estimateMinutes } from './core/plan';
 import { colors, properties, sequence, statusBar, toolOptions, toolbar } from './ui/panels';
 import * as act from './ui/actions';
 import * as dlg from './ui/dialogs';
@@ -82,7 +83,7 @@ $('.topbar').append(
   ]),
   menu('Assistants', [
     ['Image → Broderie (automatique)…', () => dlg.autoDigitizeDialog()], ['Point de croix depuis une image…', dlg.crossStitchDialog], ['PhotoStitch…', dlg.photoStitchDialog], null,
-    ['Monogramme…', dlg.monogramDialog], ['Charger une police…', loadFont],
+    ['Contourner les formes…', dlg.outlineDialog], ['Monogramme…', dlg.monogramDialog], ['Charger une police…', loadFont],
   ]),
   h('div', { class: 'sep' }),
   h('button', { class: 'icon', title: 'Annuler (Ctrl+Z)', onclick: () => app.doUndo() }, '↶'),
@@ -206,10 +207,18 @@ function updSimBar() {
   playBtn.textContent = app.sim.playing ? '❚❚' : '▶';
   const cur = st[Math.min(st.length - 1, Math.max(0, i - 1))];
   const t = cur ? app.design.threads[cur.color] : null;
-  let n = 0;
-  for (let k = 0; k < i && k < st.length; k++) if (st[k].cmd === Cmd.STITCH) n++;
+  let n = 0, colors = 0, stops = 0, trims = 0;
+  for (let k = 0; k < i && k < st.length; k++) {
+    const c = st[k].cmd;
+    if (c === Cmd.STITCH) n++; else if (c === Cmd.COLOR) colors++; else if (c === Cmd.STOP) stops++; else if (c === Cmd.TRIM) trims++;
+  }
+  // temps machine : même formule que l'estimation de la barre d'état
+  const total = estimateMinutes(app.plan);
+  const done = estimateMinutes({ ...app.plan, stitchCount: n, colorChanges: colors, stops, trims });
+  const fmt = (m: number) => { const s = Math.round(m * 60); return s >= 3600 ? `${Math.floor(s / 3600)} h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}` : `${Math.floor(s / 60)} min ${String(s % 60).padStart(2, '0')}`; };
   simInfo.innerHTML = '';
-  if (t) simInfo.append(h('i', { style: { background: `rgb(${t.r},${t.g},${t.b})` } }), `${t.code} ${t.name} · point ${n.toLocaleString('fr-FR')} / ${app.plan.stitchCount.toLocaleString('fr-FR')}`);
+  if (t) simInfo.append(h('i', { style: { background: `rgb(${t.r},${t.g},${t.b})` } }), `${t.code} ${t.name} · point ${n.toLocaleString('fr-FR')} / ${app.plan.stitchCount.toLocaleString('fr-FR')}`,
+    h('span', { class: 'simtime', title: 'Temps de broderie estimé (≈ 700 points/min, changements de fil et coupes compris)' }, ` · ⏱ ${fmt(done)} / ${fmt(total)} — reste ${fmt(Math.max(0, total - done))}`));
 }
 function jumpColor(dir: 1 | -1) {
   const st = app.plan.stitches;

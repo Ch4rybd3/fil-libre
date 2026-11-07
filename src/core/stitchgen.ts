@@ -100,7 +100,8 @@ export function satinColumn(center: Pt[], width: number, closed: boolean, p: Sat
     for (let i = 0; i < L.length; i++) out.push(i % 2 ? R[i] : L[i]);
     satinPath = reversed;
   }
-  const { L, R } = satinRails(satinPath, w, closed, Math.max(0.15, p.density));
+  // densité = distance entre deux piqûres successives d'un même bord (un aller-retour complet)
+  const { L, R } = satinRails(satinPath, w, closed, Math.max(0.1, p.density / 2));
   let prev: Pt | null = out.length ? out[out.length - 1] : null;
   for (let i = 0; i < L.length; i++) {
     const q = i % 2 === 0 ? L[i] : R[i];

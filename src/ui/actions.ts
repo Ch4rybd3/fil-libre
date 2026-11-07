@@ -166,6 +166,59 @@ export function outlineOffset(distance: number, as: 'run' | 'satin' | 'fill', wi
   app.select(n.map((o) => o.id));
 }
 
+export interface OutlineOptions {
+  scope: 'selection' | 'all';
+  mode: 'each' | 'union';           // un contour par forme, ou la silhouette de l'ensemble
+  color: number;                    // index du fil
+  stitch: 'satin' | 'triple' | 'simple';
+  width: number;                    // largeur du satin (mm)
+  offset: number;                   // décalage vers l'extérieur (mm), 0 = sur le bord
+  placement: 'after' | 'end';       // juste après chaque forme, ou tous à la fin du motif
+}
+
+/** Formes auxquelles on peut ajouter un contour (surfaces : remplissages, appliqués, textes, tracés fermés). */
+export const outlinable = (o: EmbObject) => o.kind === 'fill' || o.kind === 'applique' || o.kind === 'text' || ((o.kind === 'satin' || o.kind === 'run') && o.closed);
+
+/** Ajoute un contour (satin ou point avant) autour des formes choisies. Retourne le nombre de contours créés. */
+export function addOutlines(op: OutlineOptions): number {
+  const src = (op.scope === 'all' ? app.design.objects : app.selected()).filter((o) => outlinable(o) && o.visible);
+  if (!src.length) { toast('Aucune forme à contourner', 'error'); return 0; }
+  const ringsOf = (sh: Poly[]) => (op.offset > 0 ? offsetContours(sh, op.offset, true) : sh);
+  const make = (ring: Pt[]): EmbObject => {
+    const r = signedArea(ring) > 0 ? ring : [...ring].reverse();
+    if (op.stitch === 'satin') {
+      const o = makeSatin(r, op.width, true, op.color);
+      o.satin.underlay = op.width > 1.6 ? 'center' : 'none';
+      o.name = 'Contour satin';
+      return o;
+    }
+    const o = makeRun(r, true, op.color);
+    o.run.repeats = op.stitch === 'triple' ? 3 : 1; o.run.length = 2; o.name = 'Contour';
+    return o;
+  };
+  app.checkpoint();
+  const created: EmbObject[] = [];
+  if (op.mode === 'union') {
+    const union = src.reduce<Poly[]>((acc, o) => booleanOp(acc, shapeOf(o), 'union'), []);
+    const n = ringsOf(union).map(make);
+    const last = Math.max(...src.map((o) => app.design.objects.indexOf(o)));
+    app.design.objects.splice(op.placement === 'end' ? app.design.objects.length : last + 1, 0, ...n);
+    created.push(...n);
+  } else {
+    const tail: EmbObject[] = [];
+    for (const o of src) {
+      const n = ringsOf(shapeOf(o)).map(make);
+      if (op.placement === 'end') tail.push(...n);
+      else app.design.objects.splice(app.design.objects.indexOf(o) + 1, 0, ...n);
+      created.push(...n);
+    }
+    app.design.objects.push(...tail);
+  }
+  app.changed();
+  app.select(created.map((o) => o.id));
+  return created.length;
+}
+
 /** Retire des remplissages les parties recouvertes par les objets brodés après eux. */
 export function removeOverlaps() {
   const objs = app.design.objects;

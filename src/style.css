@@ -199,3 +199,10 @@ kbd { font: 11px ui-monospace, monospace; background: var(--panel-2); border: 1p
 .palette.excluded::before { content: 'Non brodées :'; font-size: 11px; color: var(--muted); align-self: center; }
 .pal-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .pal-actions button:disabled { opacity: .45; cursor: default; }
+button.colorpick { display: inline-flex; align-items: center; gap: 6px; }
+button.colorpick i { display: inline-block; width: 16px; height: 16px; border-radius: 4px; border: 1px solid rgba(0,0,0,.25); }
+
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; align-self: center; }
+.seg button { border: none; border-radius: 0; background: var(--panel); padding: 5px 12px; }
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button.on { background: var(--accent-2); color: var(--accent); font-weight: 600; }
