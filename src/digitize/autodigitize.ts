@@ -853,7 +853,7 @@ function extractLines(mask: Uint8Array, w: number, h: number, mmPerPx: number, o
       return t;
     };
     const covered = new Int32Array(cw * chh);
-    let pieceId = 0, overlap = 0;
+    let pieceId = 0, overlap = 0, spread = 0, samples = 0;
     const cover = (a: Pt, b: Pt) => {
       const n = Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) * 2) + 1;
       for (let k = 0; k <= n; k++) {
@@ -906,6 +906,13 @@ function extractLines(mask: Uint8Array, w: number, h: number, mmPerPx: number, o
         Lp.push({ x: c.x + nx * dl, y: c.y + ny * dl });
         Rp.push({ x: c.x - nx * dr, y: c.y - ny * dr });
         cover(Lp[i], Rp[i]);
+        // éventail : un bord avance beaucoup plus vite que l'autre (angle, jonction, zone triangulaire)
+        if (i > 0) {
+          samples++;
+          const gl = Math.hypot(Lp[i].x - Lp[i - 1].x, Lp[i].y - Lp[i - 1].y);
+          const gr = Math.hypot(Rp[i].x - Rp[i - 1].x, Rp[i].y - Rp[i - 1].y);
+          if (Math.max(gl, gr) > Math.max(2.5 * stepPx, 0.6 / mmPerPx)) spread++;
+        }
       }
       // sous-couche centrale (traits larges), puis satin en revenant
       const out: Pt[] = [];
@@ -921,7 +928,7 @@ function extractLines(mask: Uint8Array, w: number, h: number, mmPerPx: number, o
     // couverture insuffisante : on garde le remplissage d'origine pour ce trait
     let miss = 0;
     for (let i = 0; i < sub.length; i++) if (sub[i] && !covered[i]) miss++;
-    if (!pieces.length || miss > px.length * 0.18 || overlap > px.length * 0.12) continue;
+    if (!pieces.length || miss > px.length * 0.18 || overlap > px.length * 0.12 || spread > samples * 0.06) continue;
     const off = (q: Pt): Pt => ({ x: q.x + minX - 1, y: q.y + minY - 1 });
     emit(pieces.map((pc) => ({ ...pc, pts: pc.pts.map(off) })));
     for (const p of px) rest[p] = 0;
