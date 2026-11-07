@@ -3,9 +3,9 @@ import { app, type Tool } from './state';
 import { add, checkField, clear, h, numField, rangeField, selectField } from './dom';
 import { rgbOf, threadFromHex } from '../core/threads';
 import type { EmbObject, FillParams, SatinParams, Underlay } from '../core/types';
-import { allFonts, onFontLoaded } from '../core/text';
+import { fontInfo, onFontLoaded, SCRIPT_NAMES } from '../core/text';
 import * as act from './actions';
-import { threadPicker } from './dialogs';
+import { fontPicker, threadPicker } from './dialogs';
 import { toolOpts } from './tools';
 import { estimateMinutes } from '../core/plan';
 
@@ -212,10 +212,9 @@ function textFields(o: Extract<EmbObject, { kind: 'text' }>) {
   const ta = h('textarea', { rows: 2, value: o.text });
   let t = 0;
   ta.addEventListener('input', () => { clearTimeout(t); t = window.setTimeout(() => edit(() => (o.text = ta.value || ' ')), 250); });
-  const fonts = allFonts();
-  const cats = [...new Set(fonts.map((f) => f.category))];
-  const fsel = h('select', {}, cats.map((c) => h('optgroup', { label: c }, fonts.filter((f) => f.category === c).map((f) => h('option', { value: f.id, selected: f.id === o.font }, f.name)))));
-  fsel.addEventListener('change', () => edit(() => (o.font = fsel.value)));
+  const fi = fontInfo(o.font);
+  const fsel = h('button', { class: 'fontbtn', title: 'Choisir parmi toutes les polices', onclick: () => fontPicker(o.font, o.text, (id) => edit(() => (o.font = id))) },
+    h('span', {}, fi?.name ?? o.font), h('em', {}, (fi?.scripts ?? []).filter((s) => s !== 'latin').map((s) => SCRIPT_NAMES[s]).slice(0, 2).join(', ') || fi?.category || ''));
   return [
     h('label', { class: 'field' }, h('span', {}, 'Texte'), ta),
     h('label', { class: 'field' }, h('span', {}, 'Police'), fsel),

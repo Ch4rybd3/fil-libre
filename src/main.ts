@@ -7,7 +7,7 @@ import { colors, properties, sequence, statusBar, toolOptions, toolbar } from '.
 import * as act from './ui/actions';
 import * as dlg from './ui/dialogs';
 import { HOOPS, newDesign } from './core/defaults';
-import { onFontLoaded, registerUserFont } from './core/text';
+import { onFontLoadStart, onFontLoaded, registerUserFont } from './core/text';
 import { Cmd, type Design } from './core/types';
 import { designName } from './formats/encode';
 import { importedToObjects, readMachineFile } from './formats';
@@ -38,6 +38,7 @@ const tools = new Tools(r, canvas);
 app.on('redraw', () => r.request());
 app.on('view', () => r.request());
 onFontLoaded(() => { app.changed(); });
+onFontLoadStart((f) => { if ((f.kb ?? 0) > 1000) toast(`Chargement de la police ${f.name} (${Math.round((f.kb ?? 0) / 1024)} Mo)…`); });
 
 toolbar($('.toolbar'));
 toolOptions($('.tool-options'));

@@ -1,14 +1,14 @@
 // Boîtes de dialogue : nuancier, assistants image, export, impression, monogramme, aide.
 import { app } from './state';
-import { checkField, clear, download, h, modal, numField, pickFile, rangeField, selectField, toast } from './dom';
+import { add, checkField, clear, download, h, modal, numField, pickFile, rangeField, selectField, toast } from './dom';
 import { CHARTS, hexOf, rgbOf, threadFromHex } from '../core/threads';
 import type { Design, EmbObject, Thread } from '../core/types';
 import { Cmd } from '../core/types';
-import { autoDigitize, crossStitch, defaultAuto, imageToData, photoStitch, quantize, type AutoOptions } from '../digitize/autodigitize';
+import { autoDigitize, crossStitch, defaultAuto, imageToData, labToRgb, photoStitch, quantize, threadsOf, unifyThreads, workSize, type AutoOptions, type Quantized } from '../digitize/autodigitize';
 import { exportDesign, importedToObjects, readMachineFile, type ExportFormat } from '../formats';
 import { estimateMinutes } from '../core/plan';
 import { HOOPS, makeSatin, makeText, shapePoints, uid, type ShapeKind } from '../core/defaults';
-import { allFonts } from '../core/text';
+import { allFonts, fontInfo, fontUrl, SCRIPT_NAMES, type FontInfo, type Script } from '../core/text';
 import { designName } from '../formats/encode';
 
 // ------------------------------------------------------------------ Nuancier
@@ -36,6 +36,81 @@ export function threadPicker(onPick: (t: Thread) => void, title = 'Choisir un fi
   render();
   const close = modal(title, body, [], true);
 }
+
+// ------------------------------------------------------------------ Choix de police
+
+const SAMPLES: Partial<Record<Script, string>> = {
+  cyrillic: 'Привет', greek: 'Γειά σου', hebrew: 'שלום', arabic: 'مرحبا', kana: 'こんにちは', han: '你好 刺繡',
+  hangul: '안녕하세요', thai: 'สวัสดี', georgian: 'გამარჯობა', armenian: 'Բարեւ',
+};
+const previewFaces = new Map<string, Promise<string>>();
+
+/** Charge une police dans le navigateur (FontFace) pour l'aperçu. Retourne le nom CSS. */
+function cssFont(f: FontInfo): Promise<string> {
+  let p = previewFaces.get(f.id);
+  if (!p) {
+    const name = 'fl-' + f.id.replace(/[^a-z0-9]/gi, '');
+    p = new FontFace(name, `url(${fontUrl(f)})`).load().then((ff) => { document.fonts.add(ff); return name; }).catch(() => 'system-ui');
+    previewFaces.set(f.id, p);
+  }
+  return p;
+}
+
+/** Catalogue des polices avec aperçu, recherche et filtres par style et par alphabet. */
+export function fontPicker(current: string, sample: string, onPick: (id: string) => void) {
+  const fonts = allFonts();
+  const cats = ['Toutes', ...new Set(fonts.map((f) => f.category))];
+  let cat = 'Toutes', script: Script | '' = '', q = '';
+  let text = sample.split('\n')[0].trim().slice(0, 40) || 'Fil Libre';
+  const grid = h('div', { class: 'font-grid' });
+  const io = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      if (!e.isIntersecting) continue;
+      const el = e.target as HTMLElement;
+      io.unobserve(el);
+      const f = fonts.find((x) => x.id === el.dataset.id);
+      if (f?.file) cssFont(f).then((n) => { el.style.fontFamily = `"${n}", system-ui`; el.classList.remove('loading'); });
+    }
+  }, { root: grid, rootMargin: '200px' });
+  const render = () => {
+    clear(grid);
+    io.disconnect();
+    const list = fonts.filter((f) => (cat === 'Toutes' || f.category === cat) && (!script || f.scripts?.includes(script)) && (!q || f.name.toLowerCase().includes(q)));
+    if (!list.length) grid.appendChild(h('p', { class: 'hint' }, 'Aucune police ne correspond.'));
+    for (const f of list) {
+      const big = (f.kb ?? 0) > 1500;
+      const pv = h('div', { class: 'fp-sample loading', 'data-id': f.id }, text);
+      const card = h('button', { class: 'font-card' + (f.id === current ? ' on' : ''), title: f.name, onclick: () => { onPick(f.id); close(); } },
+        pv,
+        h('div', { class: 'fp-meta' }, h('b', {}, f.name), h('small', {}, f.category + (big ? ` · ${Math.round((f.kb ?? 0) / 1024)} Mo` : ''))),
+        h('div', { class: 'fp-scripts' }, (f.scripts ?? []).filter((s) => s !== 'latin').map((s) => h('span', {}, SCRIPT_NAMES[s]))));
+      grid.appendChild(card);
+      if (f.file && !big) io.observe(pv);
+      else if (big) { pv.classList.remove('loading'); pv.classList.add('big'); }
+      else pv.classList.remove('loading');
+    }
+  };
+  const chips = h('div', { class: 'chips' }, cats.map((c) => h('button', { class: c === cat ? 'on' : '', onclick: (e: Event) => { cat = c; chips.querySelectorAll('button').forEach((b) => b.classList.toggle('on', b === e.currentTarget)); render(); } }, c)));
+  const scripts = Object.keys(SCRIPT_NAMES) as Script[];
+  const sampleIn = h('input', { value: text, oninput: () => { text = sampleIn.value || 'Fil Libre'; grid.querySelectorAll('.fp-sample').forEach((el) => (el.textContent = text)); } });
+  const body = h('div', { class: 'fontpicker' },
+    h('div', { class: 'row' },
+      h('label', { class: 'field' }, h('span', {}, 'Rechercher'), h('input', { type: 'search', placeholder: 'nom de police', oninput: (e: Event) => { q = (e.target as HTMLInputElement).value.toLowerCase(); render(); } })),
+      selectField<Script | ''>('Alphabet', '', [['', 'Tous'], ...scripts.map((s) => [s, SCRIPT_NAMES[s]] as [Script, string])], (v) => {
+        script = v;
+        if (v && SAMPLES[v] && !/[^\u0000-ɏ]/.test(text)) { text = SAMPLES[v]!; sampleIn.value = text; }
+        render();
+      }),
+      h('label', { class: 'field' }, h('span', {}, 'Texte d\'aperçu'), sampleIn),
+    ),
+    chips,
+    h('p', { class: 'hint' }, 'Les caractères absents d\'une police (cyrillique, japonais, arabe…) sont automatiquement pris dans une police Noto adaptée. Les polices chinoises, japonaises et coréennes pèsent plusieurs Mo : elles se chargent au premier usage.'),
+    grid);
+  render();
+  const close = modal('Choisir une police', body, [], true);
+}
+
+export const fontLabel = (id: string) => fontInfo(id)?.name ?? id;
 
 // ------------------------------------------------------------------ Lecture d'image
 
@@ -76,49 +151,183 @@ export async function autoDigitizeDialog(file?: File) {
   if (!f) return;
   const img = await loadImageFile(f);
   const dataUrl = await fileToDataUrl(f);
-  const o: AutoOptions = { ...defaultAuto, widthMm: Math.round(Math.min(app.hoop.w, app.hoop.h) * 0.7) };
+  const o: AutoOptions = { ...defaultAuto, groups: [], excluded: [], widthMm: Math.round(Math.min(app.hoop.w, app.hoop.h) * 0.7) };
   const ratio = img.height / img.width;
-  const preview = h('canvas', { class: 'preview' });
+  const preview = h('canvas', { class: 'preview clickable', title: 'Cliquez sur une couleur pour la sélectionner' });
+  const original = h('img', { class: 'preview', src: dataUrl, style: { display: 'none' } });
   const info = h('div', { class: 'hint' });
-  const swatches = h('div', { class: 'swatches' });
+  const swatches = h('div', { class: 'palette' });
+  const excludedBox = h('div', { class: 'palette excluded' });
+  const selected = new Set<number>();
   let keepBg = false;
   let timer = 0;
-  const work = () => imageToData(img, Math.min(700, Math.max(150, Math.round(o.widthMm / 0.25))));
+  let cur: { q: Quantized; shown: Quantized; threads: (Thread | null)[]; shownOf: Map<number, number> } | null = null;
+  let data: ImageData | null = null, dataKey = '';
+  const work = () => {
+    const key = `${workSize(o)}`;
+    if (!data || key !== dataKey) { data = imageToData(img, workSize(o), 3); dataKey = key; }
+    return data;
+  };
+  /** Nuances d'origine (Lab) regroupées sous une pastille affichée. */
+  const labsUnder = (l: number) => {
+    const out: number[][] = [];
+    if (!cur) return out;
+    const { q, shownOf } = cur;
+    q.fate.forEach((f, ql) => { if (f >= 0 && shownOf.get(f) === l) out.push(q.lab[ql]); });
+    return out;
+  };
+  const mergeBtn = h('button', { disabled: true, onclick: () => {
+    if (!cur || selected.size < 2) return;
+    // mémoriser toutes les nuances d'origine réunies sous chaque pastille
+    o.groups.push([...selected].flatMap(labsUnder));
+    selected.clear(); update();
+  } }, 'Fusionner la sélection');
+  const excludeBtn = h('button', { disabled: true, onclick: () => {
+    if (!cur || !selected.size) return;
+    for (const l of selected) o.excluded.push(...labsUnder(l));
+    selected.clear(); update();
+  } }, 'Ne pas broder');
+  const resetBtn = h('button', { class: 'linkbtn', onclick: () => { o.groups = []; o.excluded = []; selected.clear(); update(); } }, 'Annuler les regroupements');
+  const syncButtons = () => {
+    mergeBtn.disabled = selected.size < 2;
+    excludeBtn.disabled = selected.size < 1;
+    mergeBtn.textContent = selected.size >= 2 ? `Fusionner (${selected.size})` : 'Fusionner la sélection';
+    swatches.querySelectorAll<HTMLElement>('.sw').forEach((b) => b.classList.toggle('on', selected.has(+b.dataset.l!)));
+  };
+  const toggleSel = (l: number) => { if (selected.has(l)) selected.delete(l); else selected.add(l); syncButtons(); };
+  preview.addEventListener('click', (e) => {
+    if (!cur) return;
+    const r = preview.getBoundingClientRect();
+    const x = Math.floor(((e.clientX - r.left) / r.width) * cur.shown.w), y = Math.floor(((e.clientY - r.top) / r.height) * cur.shown.h);
+    const l = cur.shown.labels[y * cur.shown.w + x];
+    if (l >= 0) toggleSel(l);
+  });
+  const draw = () => {
+    if (!cur) return;
+    const { shown: q, threads } = cur;
+    preview.width = q.w; preview.height = q.h;
+    const ctx = preview.getContext('2d')!;
+    const out = ctx.createImageData(q.w, q.h);
+    const colOf = (l: number) => threads[l] ?? q.palette[l];
+    const lum = (c: { r: number; g: number; b: number }) => 0.299 * c.r + 0.587 * c.g + 0.114 * c.b;
+    const used = [...new Set(Array.from(q.labels).filter((l) => l >= 0))];
+    const darkest = used.length ? used.reduce((a, b) => (lum(colOf(a)) < lum(colOf(b)) ? a : b)) : -1;
+    const W = q.w;
+    for (let i = 0; i < q.w * q.h; i++) {
+      const l = q.labels[i];
+      const checker = ((i % W) >> 3) % 2 === (((i / W) | 0) >> 3) % 2 ? { r: 235, g: 235, b: 235 } : { r: 250, g: 250, b: 250 };
+      let c = l >= 0 ? colOf(l) : checker;
+      if (o.render === 'outline' || o.contour === 'all') {
+        const x = i % W;
+        const edge = (x < W - 1 && q.labels[i + 1] !== l) || (i + W < q.labels.length && q.labels[i + W] !== l) || (x > 0 && q.labels[i - 1] !== l) || (i >= W && q.labels[i - W] !== l);
+        if (o.render === 'outline') {
+          const paper = { r: 252, g: 252, b: 250 };
+          if (o.outlineColor === 'lines') {
+            const nbDark = (x < W - 1 && q.labels[i + 1] === darkest) || (i + W < q.labels.length && q.labels[i + W] === darkest) || (x > 0 && q.labels[i - 1] === darkest) || (i >= W && q.labels[i - W] === darkest);
+            c = l === darkest ? colOf(darkest) : edge && l >= 0 && !nbDark ? colOf(darkest) : paper;
+          } else c = edge && l >= 0 ? colOf(o.outlineColor === 'darkest' ? darkest : l) : paper;
+        }
+        else if (edge) c = colOf(darkest);
+      }
+      out.data[i * 4] = c.r; out.data[i * 4 + 1] = c.g; out.data[i * 4 + 2] = c.b; out.data[i * 4 + 3] = 255;
+    }
+    ctx.putImageData(out, 0, 0);
+    // palette : une pastille par bobine
+    clear(swatches);
+    const total = used.reduce((s, l) => s + q.counts[l], 0) || 1;
+    used.sort((a, b) => q.counts[b] - q.counts[a]);
+    for (const l of used) {
+      const c = colOf(l), t = threads[l];
+      const pct = (100 * q.counts[l]) / total;
+      swatches.appendChild(h('button', {
+        class: 'sw' + (selected.has(l) ? ' on' : ''), 'data-l': String(l),
+        title: (t ? `${t.code} ${t.name}` : rgbOf({ ...c, name: '', code: '', chart: '' })) + ` — ${pct.toFixed(1)} % de la surface`,
+        onclick: () => toggleSel(l),
+      }, h('i', { style: { background: `rgb(${c.r},${c.g},${c.b})` } }), h('span', {}, pct < 1 ? '<1 %' : Math.round(pct) + ' %')));
+    }
+    for (const l of [...selected]) if (!used.includes(l)) selected.delete(l);
+    syncButtons();
+    clear(excludedBox);
+    o.excluded.forEach((c, i) => {
+      const rgb = labToRgb(c);
+      excludedBox.appendChild(h('button', { class: 'sw off', title: 'Couleur non brodée — cliquez pour la rebroder', onclick: () => { o.excluded.splice(i, 1); update(); } },
+        h('i', { style: { background: `rgb(${rgb.r},${rgb.g},${rgb.b})` } }), h('span', {}, '✕')));
+    });
+    excludedBox.style.display = o.excluded.length ? '' : 'none';
+    const raw = new Set(Array.from(cur.q.labels).filter((l) => l >= 0)).size;
+    info.textContent = `${o.widthMm} × ${Math.round(o.widthMm * ratio)} mm — ${used.length} bobine(s)` +
+      (raw > used.length ? ` (${raw} nuances, réunies quand elles tombent sur le même fil)` : '') + (o.groups.length ? ` — ${o.groups.length} regroupement(s) manuel(s)` : '');
+  };
   const update = () => {
     clearTimeout(timer);
+    info.textContent = 'Calcul…';
     timer = window.setTimeout(() => {
-      const data = work();
-      const q = quantize(data, o);
-      preview.width = q.w; preview.height = q.h;
-      const ctx = preview.getContext('2d')!;
-      const out = ctx.createImageData(q.w, q.h);
-      for (let i = 0; i < q.w * q.h; i++) {
-        const l = q.labels[i];
-        const c = l >= 0 ? q.palette[l] : ((i % q.w) >> 3) % 2 === (((i / q.w) | 0) >> 3) % 2 ? { r: 235, g: 235, b: 235 } : { r: 250, g: 250, b: 250 };
-        out.data[i * 4] = c.r; out.data[i * 4 + 1] = c.g; out.data[i * 4 + 2] = c.b; out.data[i * 4 + 3] = 255;
-      }
-      ctx.putImageData(out, 0, 0);
-      clear(swatches);
-      const used = new Set(Array.from(q.labels).filter((l) => l >= 0));
-      for (const l of used) swatches.appendChild(h('i', { style: { background: rgbOf({ ...q.palette[l], name: '', code: '', chart: '' }) } }));
-      info.textContent = `${o.widthMm} × ${Math.round(o.widthMm * ratio)} mm — ${used.size} couleur(s) brodée(s)`;
-    }, 150);
+      const q = quantize(work(), o);
+      const shown = unifyThreads(q, o.threadChart);
+      shown.counts = new Int32Array(q.counts.length);
+      for (const l of shown.labels) if (l >= 0) shown.counts[l]++;
+      const shownOf = new Map<number, number>();
+      for (let i = 0; i < q.labels.length; i++) if (q.labels[i] >= 0 && !shownOf.has(q.labels[i])) shownOf.set(q.labels[i], shown.labels[i]);
+      cur = { q, shown, threads: threadsOf(q, o.threadChart), shownOf };
+      draw();
+    }, 180);
   };
+  const extra = h('div', {});
+  const renderExtra = () => {
+    clear(extra);
+    if (o.render === 'fill') {
+      add(extra,
+        numField('Satin si plus fin que', o.satinWidth, (v) => { o.satinWidth = v; }, { min: 0, max: 10, step: 0.5, unit: 'mm', title: 'Les zones étroites sont brodées en satin, les larges en tatami' }),
+        selectField('Contour par-dessus', o.contour, [['none', 'Aucun'], ['silhouette', 'Silhouette extérieure'], ['all', 'Toutes les limites entre couleurs']], (v) => { o.contour = v; renderExtra(); draw(); }, 'Contour brodé dans la couleur la plus foncée'),
+      );
+    } else {
+      add(extra, selectField('Contours', o.outlineColor, [
+        ['lines', 'Suivre les traits foncés du dessin'], ['darkest', 'Limites entre couleurs (une couleur)'], ['each', 'Chaque zone dans sa couleur']], (v) => { o.outlineColor = v; draw(); },
+        '« Suivre les traits » : pour un dessin déjà cerné de noir, brode le milieu de chaque trait (une seule ligne). « Limites » : brode une fois chaque frontière entre deux couleurs. « Chaque zone » : entoure chaque zone dans sa propre couleur.'));
+    }
+    if (o.render === 'outline' || o.contour !== 'none') {
+      add(extra, selectField('Point du contour', o.outlineStitch, [['triple', 'Point triple'], ['simple', 'Point avant simple'], ['satin', 'Satin']], (v) => { o.outlineStitch = v; renderExtra(); }));
+      if (o.outlineStitch === 'satin') add(extra, numField('Largeur du satin', o.outlineWidth, (v) => { o.outlineWidth = v; }, { min: 0.8, max: 6, step: 0.1, unit: 'mm' }));
+    }
+  };
+  renderExtra();
+  const sec = (t: string) => h('h4', { class: 'sec' }, t);
   const controls = h('div', { class: 'controls' },
+    sec('Taille'),
     numField('Largeur', o.widthMm, (v) => { o.widthMm = v; update(); }, { min: 10, max: 300, step: 1, unit: 'mm' }),
-    rangeField('Couleurs', o.colors, 1, 16, 1, (v) => { o.colors = v; update(); }),
+    selectField('Précision', String(o.precision), [['0.3', 'Rapide'], ['0.2', 'Normale'], ['0.14', 'Fine'], ['0.1', 'Très fine (lent)']], (v) => { o.precision = +v; update(); },
+      'Résolution de l\'analyse : plus fine = contours plus fidèles et petits détails conservés'),
+    sec('Couleurs'),
+    rangeField('Couleurs à détecter', o.colors, 1, 16, 1, (v) => { o.colors = v; update(); }),
+    rangeField('Fusionner les nuances proches', o.mergeDE, 0, 40, 1, (v) => { o.mergeDE = v; update(); }, (v) => (v ? (v < 10 ? 'léger' : v < 20 ? 'moyen' : 'fort') + ` (${v})` : 'non')),
+    selectField('Fils', o.threadChart, [['Janome/Elna', 'Nuancier Janome/Elna'], ['Brother', 'Nuancier Brother'], ['exact', 'Couleurs exactes de l\'image']], (v) => { o.threadChart = v; update(); }),
     checkField('Retirer le fond', o.removeBg, (v) => { o.removeBg = v; update(); }, 'La couleur dominante sur les bords de l\'image n\'est pas brodée'),
-    checkField('Réduire le bruit', o.denoise, (v) => { o.denoise = v; update(); }),
+    checkField('…seulement à l\'extérieur du motif', o.bgOutsideOnly, (v) => { o.bgOutsideOnly = v; update(); }, 'Garde les zones de la couleur du fond entourées par le dessin (yeux, griffes, reflets blancs…)'),
+    checkField('Réduire le bruit', o.denoise, (v) => { o.denoise = v; update(); }, 'Lisse les dégradés et artefacts JPEG sans baver sur les contours'),
+    sec('Rendu'),
+    selectField('Type', o.render, [['fill', 'Remplissage (zones pleines)'], ['outline', 'Contours seulement (sans remplissage)']], (v) => { o.render = v; renderExtra(); draw(); }),
+    extra,
     rangeField('Lissage des contours', o.smooth, 0, 3, 1, (v) => { o.smooth = v; }),
     numField('Ignorer les zones <', o.minAreaMm2, (v) => { o.minAreaMm2 = v; update(); }, { min: 0, max: 50, step: 0.5, unit: 'mm²' }),
-    numField('Satin si plus fin que', o.satinWidth, (v) => { o.satinWidth = v; }, { min: 0, max: 10, step: 0.5, unit: 'mm', title: 'Les zones étroites sont brodées en satin, les larges en tatami' }),
-    checkField('Contour en point triple (couleur foncée)', o.outline, (v) => { o.outline = v; }),
-    selectField('Fils', o.threadChart, [['Janome/Elna', 'Nuancier Janome/Elna'], ['Brother', 'Nuancier Brother'], ['exact', 'Couleurs exactes de l\'image']], (v) => { o.threadChart = v; }),
     checkField('Garder l\'image en fond (pour retoucher)', keepBg, (v) => { keepBg = v; }),
-    h('p', { class: 'hint' }, 'Conseil : les logos et dessins aux aplats francs donnent les meilleurs résultats. Pour une photo, essayez PhotoStitch.'),
+  );
+  const toggleOrig = h('button', { class: 'linkbtn', onclick: () => {
+    const show = original.style.display === 'none';
+    original.style.display = show ? '' : 'none';
+    preview.style.display = show ? 'none' : '';
+    toggleOrig.textContent = show ? 'Voir le résultat' : 'Voir l\'image d\'origine';
+  } }, 'Voir l\'image d\'origine');
+  const side = h('div', { class: 'pv' },
+    h('div', { class: 'pv-img' }, preview, original), toggleOrig, info,
+    h('div', { class: 'pal-box' },
+      h('div', { class: 'pal-head' }, h('b', {}, 'Bobines'), h('small', {}, 'Cliquez sur des pastilles (ou dans l\'image) pour les sélectionner')),
+      swatches,
+      h('div', { class: 'pal-actions' }, mergeBtn, excludeBtn, resetBtn),
+      excludedBox,
+    ),
   );
   update();
-  modal('Image → Broderie (numérisation automatique)', h('div', { class: 'wizard' }, controls, h('div', { class: 'pv' }, preview, swatches, info)), [
+  modal('Image → Broderie (numérisation automatique)', h('div', { class: 'wizard' }, controls, side), [
     { label: 'Annuler', onClick: () => {} },
     {
       label: 'Générer la broderie', primary: true, onClick: () => {

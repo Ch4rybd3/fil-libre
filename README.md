@@ -87,10 +87,10 @@ Votre travail est sauvegardé automatiquement dans le navigateur ; utilisez **En
 
 | Domaine | Fonctions |
 |---|---|
-| Numérisation | Image → broderie automatique (réduction de couleurs, suppression du fond, vectorisation, satin/tatami selon la largeur), point de croix, PhotoStitch, image de fond pour décalquer |
+| Numérisation | Image → broderie automatique : réduction de couleurs, fusion automatique des nuances proches, regroupement / exclusion manuels des couleurs (pastilles cliquables), précision réglable, suppression du fond qui garde les zones claires intérieures, satin/tatami selon la largeur, contour par-dessus ; mode **contours seuls** (ligne centrale des traits du dessin, limites entre couleurs ou contour de chaque zone, en point triple, simple ou satin) ; point de croix, PhotoStitch, image de fond pour décalquer |
 | Types de points | Point avant (simple / triple / quintuple), colonne satin, remplissage tatami / satin / contour, appliqué (placement → arrêt → fixation → arrêt → bordure) |
 | Réglages | Densité, longueur de point, angle, décalage du motif, compensation de traction, sous-couches (centrale, contour, zigzag, tatami), satin fractionné, points d'arrêt, coupes |
-| Lettrage | 17 polices libres + vos polices TTF/OTF, texte en arc, interlettrage, multi-ligne, satin / tatami / point avant, monogrammes avec cadre |
+| Lettrage | 107 polices libres avec catalogue et aperçus (bâton, empattement, script, manuscrite, fantaisie, gothique…) + vos polices TTF/OTF ; alphabets latin, cyrillique, grec, hébreu, arabe (lettres liées), japonais, chinois, coréen, thaï, géorgien, arménien, symboles et emoji (police de secours automatique pour les caractères absents) ; texte en arc, interlettrage, multi-ligne, satin / tatami / point avant, monogrammes avec cadre |
 | Édition | Formes (cercle, rectangle, étoile, cœur, fleur…), main levée, nœuds, déplacer / redimensionner / pivoter / miroir, aligner, combiner / séparer, conversion entre types, bordure et contour décalé, suppression des chevauchements, ordre de broderie par glisser-déposer, annuler / rétablir |
 | Fils | Nuanciers Janome/Elna (codes JEF) et Brother, couleurs libres, optimisation de l'ordre des couleurs |
 | Vérification | Rendu réaliste, simulateur de broderie, sauts, statistiques (points, couleurs, coupes, durée), alerte de dépassement du cercle |
@@ -109,5 +109,7 @@ Cercles proposés : RE28b 200×280, SQ20b 200×200, RE20b 140×200, SQ14b 140×1
 ## Licence
 
 Code sous licence [MIT](LICENSE). Les polices de `public/fonts` proviennent de Google Fonts et
-restent sous leur propre licence (SIL Open Font License ou Apache 2.0).
+restent sous leur propre licence (SIL Open Font License, Apache 2.0 ou Ubuntu Font Licence).
+Elles ont été figées à une graisse et allégées (sans hinting) avec fontTools ; les polices chinoises,
+japonaises et coréennes (5 à 10 Mo) ne sont téléchargées qu'au premier usage.
 Fil Libre n'est ni affilié ni approuvé par Elna ou Janome.
