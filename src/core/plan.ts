@@ -1,6 +1,6 @@
 // Transforme le dessin (objets) en séquence de points prête à exporter.
 import { Cmd, type Design, type EmbObject, type Poly, type Pt, type Stitch } from './types';
-import { appliqueStitches, fillRegion, runPath, satinColumn, tieIn, tieOff } from './stitchgen';
+import { appliqueStitches, fillRegion, runPath, satinColumn } from './stitchgen';
 import { textGlyphs } from './text';
 import { dist, bboxOf, type BBox, bboxValid } from './geometry';
 
@@ -96,20 +96,50 @@ export function objectBBox(o: EmbObject): BBox | null {
   return bb;
 }
 
-/** Ajoute les points d'arrêt autour de chaque séquence cousue continue. */
-function withTies(st: Stitch[], trimDistance: number): Stitch[] {
-  const chunks: Stitch[][] = [];
-  let curChunk: Stitch[] = [];
-  let prev: Stitch | null = null;
-  for (const s of st) {
-    const longJump = s.cmd === Cmd.JUMP && prev && dist(prev, s) > trimDistance;
-    if ((longJump || s.cmd === Cmd.STOP) && curChunk.length) { chunks.push(curChunk); curChunk = []; }
-    curChunk.push(s);
-    prev = s;
+/** Point situé à `d` mm le long de la suite de points, en partant de `from` dans le sens `dir`. */
+function walk(out: PlanStitch[], from: number, dir: 1 | -1, d: number, stop: (s: PlanStitch) => boolean): Pt | null {
+  let acc = 0, prev: Pt = out[from];
+  for (let i = from + dir; i >= 0 && i < out.length && !stop(out[i]); i += dir) {
+    if (out[i].cmd !== Cmd.STITCH) break;
+    const L = dist(prev, out[i]);
+    if (acc + L >= d) { const t = (d - acc) / L; return { x: prev.x + (out[i].x - prev.x) * t, y: prev.y + (out[i].y - prev.y) * t }; }
+    acc += L; prev = out[i];
   }
-  if (curChunk.length) chunks.push(curChunk);
-  return chunks.flatMap((c) => tieOff(tieIn(c)));
+  return acc >= 0.3 ? prev : null;
 }
+
+/**
+ * Points d'arrêt : uniquement là où le fil est coupé (début, coupe, changement de couleur).
+ * Les petits sauts sans coupe gardent le fil continu et n'en ont pas besoin, ce qui évite
+ * d'accumuler des nœuds sous la broderie. Chaque arrêt fait 2 allers-retours de ~0,6 mm.
+ */
+function addTies(out: PlanStitch[], tieOf: (obj: number) => boolean): PlanStitch[] {
+  const cut = (s: PlanStitch) => s.cmd === Cmd.TRIM || s.cmd === Cmd.COLOR;
+  const res: PlanStitch[] = [];
+  let needIn = true;
+  for (let i = 0; i < out.length; i++) {
+    const s = out[i];
+    if (cut(s)) needIn = true;
+    res.push(s);
+    if (s.cmd !== Cmd.STITCH) continue;
+    if (needIn) {
+      needIn = false;
+      const m = tieOf(s.obj) ? walk(out, i, 1, 0.6, cut) : null;
+      if (m) for (const q of [m, s, m, s]) res.push({ ...s, x: q.x, y: q.y });
+    }
+    // dernier point avant une coupe (ou la fin) : arrêt
+    let j = i + 1;
+    while (j < out.length && out[j].cmd !== Cmd.STITCH && !cut(out[j])) j++;
+    if (j >= out.length || cut(out[j])) {
+      const m = tieOf(s.obj) ? walk(out, i, -1, 0.6, cut) : null;
+      if (m) for (const q of [m, s, m, s]) res.push({ ...s, x: q.x, y: q.y });
+    }
+  }
+  return res;
+}
+
+/** En dessous, la machine pique presque au même trou : nœuds et casse de fil. */
+const MIN_STITCH = 0.3;
 
 export function buildPlan(design: Design, opts: PlanOptions = defaultPlanOptions): Plan {
   const out: PlanStitch[] = [];
@@ -121,7 +151,6 @@ export function buildPlan(design: Design, opts: PlanOptions = defaultPlanOptions
     if (!o.visible) return;
     let st = objectStitches(o);
     if (!st.length) return;
-    if (o.tie && o.kind !== 'stitches') st = withTies(st, opts.trimDistance);
     if (color !== o.color) {
       if (color >= 0 && last) {
         out.push({ ...last, cmd: Cmd.TRIM, color, obj: oi }); trims++;
@@ -146,7 +175,7 @@ export function buildPlan(design: Design, opts: PlanOptions = defaultPlanOptions
       }
       if (cmd === Cmd.STOP) { out.push({ x: s.x, y: s.y, cmd: Cmd.STOP, color, obj: oi }); stops++; continue; }
       if (cmd === Cmd.TRIM) { out.push({ x: s.x, y: s.y, cmd: Cmd.TRIM, color, obj: oi }); trims++; continue; }
-      if (cmd === Cmd.STITCH && last && (s.x !== last.x || s.y !== last.y) && dist(last, s) < 0.1 && out.length && out[out.length - 1].cmd === Cmd.STITCH) {
+      if (cmd === Cmd.STITCH && last && dist(last, s) < MIN_STITCH && out.length && out[out.length - 1].cmd === Cmd.STITCH) {
         continue; // points trop courts : la machine ferait des nœuds
       }
       if (!last) { out.push({ x: s.x, y: s.y, cmd: Cmd.JUMP, color, obj: oi }); jumps++; last = s; continue; }
@@ -156,6 +185,9 @@ export function buildPlan(design: Design, opts: PlanOptions = defaultPlanOptions
     }
   });
   if (last) { out.push({ ...(last as Pt), cmd: Cmd.TRIM, color, obj: -1 }); trims++; }
+  const vis = design.objects;
+  out.splice(0, out.length, ...addTies(out, (oi) => !!vis[oi]?.tie));
+  stitchCount = out.reduce((n, s) => n + (s.cmd === Cmd.STITCH ? 1 : 0), 0);
   const bbPts = out.filter((s) => s.cmd === Cmd.STITCH);
   const bb = bbPts.length ? bboxOf(bbPts) : null;
   return { stitches: out, colorChanges, stops, trims, stitchCount, jumps, bbox: bb && bboxValid(bb) ? bb : null, colorSeq };

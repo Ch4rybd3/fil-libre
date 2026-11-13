@@ -331,6 +331,9 @@ export async function autoDigitizeDialog(file?: File) {
         numField('Satin si plus fin que', o.satinWidth, (v) => { o.satinWidth = v; draw(); }, { min: 0, max: 10, step: 0.5, unit: 'mm', title: 'Les zones étroites sont brodées en satin, les larges en tatami' }),
         checkField('Traits fins en satin qui suit le trait', o.lineSatin, (v) => { o.lineSatin = v; draw(); }, 'Les zones longues et étroites (contours, liserés) deviennent une colonne satin le long de leur ligne centrale au lieu d’un remplissage'),
         checkField('Traits foncés en dernier (finition)', o.linesLast, (v) => { o.linesLast = v; draw(); }, 'Les traits de la couleur la plus foncée sont brodés à la fin, par-dessus les couleurs, pour un contour net'),
+        selectField('Densité du remplissage', String(o.fillSpacing ?? 0.4), [['0.5', 'Légère (0,5 mm)'], ['0.4', 'Normale (0,4 mm)'], ['0.33', 'Dense (0,33 mm)'], ['0.28', 'Très dense (0,28 mm)']], (v) => { o.fillSpacing = Number(v); draw(); },
+          'Écart entre les rangs du remplissage. Plus dense couvre mieux le tissu, mais rigidifie et fronce davantage : utilisez un entoilage. En dessous de 0,28 mm, risque de casse d’aiguille et de tissu percé.'),
+        numField('Recouvrement sous les traits', o.overlap ?? 0.6, (v) => { o.overlap = v; draw(); }, { min: 0, max: 1.5, step: 0.1, unit: 'mm', title: 'Les couleurs se prolongent sous les traits foncés brodés après elles : si le tissu bouge, le trait recouvre la jonction au lieu de laisser un jour' }),
         selectField('Contour par-dessus', o.contour === 'silhouette' ? 'none' : o.contour, [['none', 'Aucun'], ['all', 'Toutes les limites entre couleurs']], (v) => { o.contour = v; renderExtra(); draw(); }, 'Contour brodé dans la couleur la plus foncée'),
       );
     } else {

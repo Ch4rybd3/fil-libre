@@ -139,3 +139,24 @@ describe('alphabets', () => {
       .toEqual(['latin', 'cyrillic', 'greek', 'hebrew', 'arabic', 'kana', 'han', 'hangul', 'thai', null, null]);
   });
 });
+
+describe('plan : nœuds et points d’arrêt', () => {
+  it('aucun point au même trou, même pour un point triple fermé', () => {
+    const d = newDesign();
+    const sq = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }, { x: 0, y: 0 }];
+    const r = makeRun(sq, true, 0); r.run.repeats = 3;
+    d.objects.push(r, makeSatin([{ x: -20, y: 0 }, { x: -20, y: 20 }], 0.2, false, 0));
+    const st = buildPlan(d).stitches;
+    for (let i = 1; i < st.length; i++) {
+      if (st[i].cmd === Cmd.STITCH && st[i - 1].cmd === Cmd.STITCH) expect(Math.hypot(st[i].x - st[i - 1].x, st[i].y - st[i - 1].y)).toBeGreaterThanOrEqual(0.3);
+    }
+  });
+  it('les arrêts ne sont posés qu’aux coupes, pas entre deux objets proches', () => {
+    const d = newDesign();
+    d.objects.push(makeRun([{ x: 0, y: 0 }, { x: 10, y: 0 }], false, 0), makeRun([{ x: 11, y: 0 }, { x: 20, y: 0 }], false, 0));
+    const p = buildPlan(d);
+    expect(p.trims).toBe(1); // seulement la coupe finale
+    const back = p.stitches.filter((s, i, a) => i > 1 && s.cmd === Cmd.STITCH && a[i - 2].cmd === Cmd.STITCH && s.x === a[i - 2].x && s.y === a[i - 2].y).length;
+    expect(back).toBe(6); // un arrêt (3 allers-retours) au début, un à la fin
+  });
+});

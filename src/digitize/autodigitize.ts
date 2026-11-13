@@ -35,6 +35,8 @@ export interface AutoOptions {
   outerThread: Thread | null; // couleur du contour extérieur (null = la plus foncée du motif)
   outerStitch: 'satin' | 'triple' | 'simple';
   outerWidth: number;       // largeur du satin extérieur (mm)
+  fillSpacing: number;      // espacement des rangs de remplissage (mm) : plus petit = plus couvrant
+  overlap: number;          // les couleurs passent sous les traits foncés de cette distance (mm)
 }
 
 export const defaultAuto: AutoOptions = {
@@ -43,6 +45,7 @@ export const defaultAuto: AutoOptions = {
   render: 'fill', outlineColor: 'lines', outlineStitch: 'triple', outlineWidth: 1.2,
   keepLines: true, lineSatin: true, linesLast: true,
   outer: false, outerThread: null, outerStitch: 'satin', outerWidth: 1,
+  fillSpacing: 0.4, overlap: 0.6,
 };
 
 export interface Quantized {
@@ -853,22 +856,25 @@ function extractLines(mask: Uint8Array, w: number, h: number, mmPerPx: number, o
       return t;
     };
     const covered = new Int32Array(cw * chh);
-    let pieceId = 0, overlap = 0, spread = 0, samples = 0;
-    const cover = (a: Pt, b: Pt) => {
+    /** Pixels couverts par le segment a→b ; `dry` : compte seulement ceux déjà pris par un autre morceau. */
+    const cover = (a: Pt, b: Pt, id: number, dry: boolean) => {
+      let hit = 0, tot = 0;
       const n = Math.ceil(Math.hypot(b.x - a.x, b.y - a.y) * 2) + 1;
       for (let k = 0; k <= n; k++) {
         const x = Math.floor(a.x + ((b.x - a.x) * k) / n), y = Math.floor(a.y + ((b.y - a.y) * k) / n);
         for (const [dx, dy] of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) {
           const xx = x + dx, yy = y + dy;
           if (xx < 0 || yy < 0 || xx >= cw || yy >= chh) continue;
-          const j = yy * cw + xx, v = covered[j];
-          if (v && v !== pieceId && dx === 0 && dy === 0 && sub[j]) { overlap++; covered[j] = -1; }
-          else if (!v) covered[j] = pieceId;
+          const j = yy * cw + xx;
+          if (dx === 0 && dy === 0 && sub[j]) { tot++; if (covered[j] && covered[j] !== id) hit++; }
+          if (!dry && !covered[j]) covered[j] = id;
         }
       }
+      return { hit, tot };
     };
     const pieces: LinePiece[] = [];
     const veryThin = wPx * mmPerPx < 0.55;
+    let pieceId = 0;
     for (const l of lines) {
       pieceId++;
       let pts = l.closed ? smoothLoop(l.pts.slice(0, -1), o.smooth) : smoothOpen(l.pts, o.smooth);
@@ -887,33 +893,48 @@ function extractLines(mask: Uint8Array, w: number, h: number, mmPerPx: number, o
       const path = resample(pts, Math.max(0.3, stepPx), l.closed);
       if (path.length < 2) continue;
       if (veryThin) {
-        for (let i = 1; i < path.length; i++) cover(path[i - 1], path[i]);
+        let hit = 0, tot = 0;
+        for (let i = 1; i < path.length; i++) { const r = cover(path[i - 1], path[i], pieceId, true); hit += r.hit; tot += r.tot; }
+        if (tot && hit > tot * 0.5) continue; // doublon d'un trait déjà pris
+        for (let i = 1; i < path.length; i++) cover(path[i - 1], path[i], pieceId, false);
         pieces.push({ kind: 'run', pts: path, closed: l.closed });
         continue;
       }
       // normales lissées, rayons jusqu'aux deux bords
       const n = path.length;
-      const Lp: Pt[] = [], Rp: Pt[] = [];
+      const C: Pt[] = [], N: Pt[] = [], ML: number[] = [], MR: number[] = [];
       for (let i = 0; i < n; i++) {
         const a = path[l.closed ? (i - 3 + n) % n : Math.max(0, i - 3)], b = path[l.closed ? (i + 3) % n : Math.min(n - 1, i + 3)];
         const tl = Math.hypot(b.x - a.x, b.y - a.y) || 1;
         const nx = -(b.y - a.y) / tl, ny = (b.x - a.x) / tl;
-        const c = path[i];
-        const ml = march(c, { x: nx, y: ny }), mr = march(c, { x: -nx, y: -ny });
+        C.push(path[i]); N.push({ x: nx, y: ny });
+        ML.push(march(path[i], { x: nx, y: ny })); MR.push(march(path[i], { x: -nx, y: -ny }));
+      }
+      // aux jonctions et dans les coudes, un rayon file le long d'une autre branche : on le borne
+      // à la demi-largeur typique du trait pour éviter les piqûres en éventail
+      const half = [...ML, ...MR].sort((x, y) => x - y)[Math.floor(ML.length)] || wPx / 2;
+      const cap = Math.max(1, half * 1.6);
+      const Lp: Pt[] = [], Rp: Pt[] = [];
+      for (let i = 0; i < n; i++) {
+        const ml = Math.min(ML[i], cap), mr = Math.min(MR[i], cap);
         // compensation proportionnelle à la largeur : les pointes restent pointues
         const pc = pull * Math.min(1, ((ml + mr) * mmPerPx) / 1.2);
         const dl = Math.max(0.05 / mmPerPx, ml + pc), dr = Math.max(0.05 / mmPerPx, mr + pc);
-        Lp.push({ x: c.x + nx * dl, y: c.y + ny * dl });
-        Rp.push({ x: c.x - nx * dr, y: c.y - ny * dr });
-        cover(Lp[i], Rp[i]);
-        // éventail : un bord avance beaucoup plus vite que l'autre (angle, jonction, zone triangulaire)
+        Lp.push({ x: C[i].x + N[i].x * dl, y: C[i].y + N[i].y * dl });
+        Rp.push({ x: C[i].x - N[i].x * dr, y: C[i].y - N[i].y * dr });
+      }
+      // morceau en éventail ou doublon d'un trait déjà pris : il reste en remplissage
+      let spread = 0, hit = 0, tot = 0;
+      for (let i = 0; i < n; i++) {
+        const r = cover(Lp[i], Rp[i], pieceId, true); hit += r.hit; tot += r.tot;
         if (i > 0) {
-          samples++;
           const gl = Math.hypot(Lp[i].x - Lp[i - 1].x, Lp[i].y - Lp[i - 1].y);
           const gr = Math.hypot(Rp[i].x - Rp[i - 1].x, Rp[i].y - Rp[i - 1].y);
           if (Math.max(gl, gr) > Math.max(2.5 * stepPx, 0.6 / mmPerPx)) spread++;
         }
       }
+      if (spread > (n - 1) * 0.08 || (tot && hit > tot * 0.35)) continue;
+      for (let i = 0; i < n; i++) cover(Lp[i], Rp[i], pieceId, false);
       // sous-couche centrale (traits larges), puis satin en revenant
       const out: Pt[] = [];
       const order = [...Array(n).keys()];
@@ -925,13 +946,30 @@ function extractLines(mask: Uint8Array, w: number, h: number, mmPerPx: number, o
       order.forEach((i, k) => out.push(k % 2 === 0 ? Lp[i] : Rp[i]));
       pieces.push({ kind: 'satin', pts: out, closed: false });
     }
-    // couverture insuffisante : on garde le remplissage d'origine pour ce trait
+    // trop peu de trait reconnu : on garde le remplissage d'origine pour toute la forme
     let miss = 0;
     for (let i = 0; i < sub.length; i++) if (sub[i] && !covered[i]) miss++;
-    if (!pieces.length || miss > px.length * 0.18 || overlap > px.length * 0.12 || spread > samples * 0.06) continue;
+    if (!pieces.length || miss > px.length * 0.35) continue;
     const off = (q: Pt): Pt => ({ x: q.x + minX - 1, y: q.y + minY - 1 });
     emit(pieces.map((pc) => ({ ...pc, pts: pc.pts.map(off) })));
-    for (const p of px) rest[p] = 0;
+    // les bouts non couverts de la taille d'une jonction sont absorbés par les satins voisins ;
+    // seuls les gros restes (vraie zone pleine accolée au trait) restent à remplir
+    const keep = new Uint8Array(cw * chh);
+    const seen = new Uint8Array(cw * chh);
+    const lim = Math.max(minPx, 2.5 * wPx * wPx);
+    for (let s0 = 0; s0 < sub.length; s0++) {
+      if (!sub[s0] || covered[s0] || seen[s0]) continue;
+      const blob: number[] = [s0]; seen[s0] = 1;
+      for (let k = 0; k < blob.length; k++) {
+        const q = blob[k], x = q % cw;
+        for (const r of [x > 0 ? q - 1 : -1, x < cw - 1 ? q + 1 : -1, q - cw, q + cw]) {
+          if (r < 0 || r >= sub.length || !sub[r] || covered[r] || seen[r]) continue;
+          seen[r] = 1; blob.push(r);
+        }
+      }
+      if (blob.length >= lim) for (const q of blob) keep[q] = 1;
+    }
+    for (const p of px) if (!keep[((((p / w) | 0) - minY + 1) * cw) + (p % w) - minX + 1]) rest[p] = 0;
   }
   return rest;
 }
@@ -1037,6 +1075,29 @@ export function autoDigitize(q: Quantized, o: AutoOptions, threadBase: number): 
   }
 
   const finish: EmbObject[] = []; // traits de finition, brodés en dernier
+  // Recouvrement : chaque couleur se prolonge sous les traits foncés brodés après elle (jusqu'au milieu
+  // du trait au plus). Si le tissu bouge un peu, le trait noir recouvre la jonction au lieu de laisser
+  // apparaître un jour entre le contour et la couleur.
+  const owner = new Int16Array(w * h).fill(-1);
+  const ownerSrc = new Int32Array(w * h).fill(-1); // pixel de la couleur d'où vient le recouvrement
+  if (o.render === 'fill' && o.linesLast && darkest >= 0 && (o.overlap ?? 0) > 0) {
+    const r = Math.round((o.overlap ?? 0) / mmPerPx);
+    const src = new Int16Array(w * h).fill(-1); // couleur d'origine qui atteint ce pixel (-2 = fond)
+    let front: number[] = [];
+    for (let i = 0; i < w * h; i++) if (labels[i] !== darkest) { src[i] = labels[i] < 0 ? -2 : labels[i]; ownerSrc[i] = i; front.push(i); }
+    for (let step = 0; step < r && front.length; step++) {
+      const next: number[] = [];
+      for (const p of front) {
+        const x = p % w;
+        for (const q of [x > 0 ? p - 1 : -1, x < w - 1 ? p + 1 : -1, p - w, p + w]) {
+          if (q < 0 || q >= w * h || src[q] !== -1 || labels[q] !== darkest) continue;
+          src[q] = src[p]; ownerSrc[q] = ownerSrc[p]; next.push(q);
+        }
+      }
+      front = next;
+    }
+    for (let i = 0; i < w * h; i++) if (labels[i] === darkest && src[i] >= 0) owner[i] = src[i];
+  }
   const finishZones: EmbObject[] = []; // zones de la couleur des traits, juste avant eux (un seul passage de cette couleur)
   used.forEach((lab, li) => {
     const ci = threadFor(lab);
@@ -1072,6 +1133,9 @@ export function autoDigitize(q: Quantized, o: AutoOptions, threadBase: number): 
       });
       (o.linesLast && lab === darkest ? finish : objects).push(...ordered);
     }
+    // le remplissage déborde sous les traits foncés (mais les traits fins restent extraits sur la forme d'origine)
+    // (seulement à partir de la zone pleine restante : pas autour des traits fins déjà extraits)
+    if (lab !== darkest) for (let i = 0; i < w * h; i++) if (owner[i] === lab && mask[ownerSrc[i]]) mask[i] = 1;
     const loops = traceMask(mask, w, h).map((p) => smoothLoop(p, o.smooth).map(toMm));
     const islands = splitIslands(normalize(loops));
     const ordered = orderIslands(islands);
@@ -1092,12 +1156,13 @@ export function autoDigitize(q: Quantized, o: AutoOptions, threadBase: number): 
         obj.fill.angle = Math.round(((pa * 180) / Math.PI + 90 + 360) % 180);
         obj.fill.underlay = width > 1.5 ? 'center' : 'none';
         obj.fill.pullComp = 0.15;
+        obj.fill.spacing = Math.min(0.4, o.fillSpacing ?? 0.4);
         obj.name = `Satin ${li + 1}`;
       } else {
         // un seul angle par couleur : remplissage uni d'une zone à l'autre
         obj.fill.angle = angles[li % angles.length];
         obj.fill.underlay = width > 6 ? 'edge+tatami' : width > 1.5 ? 'edge' : 'none';
-        obj.fill.spacing = 0.4;
+        obj.fill.spacing = o.fillSpacing ?? 0.4;
       }
       (o.linesLast && lab === darkest ? finishZones : objects).push(obj);
     }

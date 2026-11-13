@@ -12,7 +12,8 @@ const J = (p: Pt): Stitch => ({ x: p.x, y: p.y, cmd: Cmd.JUMP });
 
 export function runPath(pts: Pt[], closed: boolean, p: RunParams): Pt[] {
   if (pts.length < 2) return pts.slice();
-  const base = subdivide(pts, Math.max(0.5, p.length), closed);
+  const base = subdivide(pts, Math.max(0.5, p.length), closed)
+    .filter((q, i, arr) => i === 0 || dist(q, arr[i - 1]) >= 0.05); // pas de point au même trou
   if (p.repeats === 1) return base;
   // point triple (« bean ») : a→b→a→b pour chaque segment
   const out: Pt[] = [base[0]];
